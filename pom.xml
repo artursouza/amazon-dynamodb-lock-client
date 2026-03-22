@@ -173,6 +173,7 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>netty-nio-client</artifactId>
             <version>${aws.java.sdk.version}</version>
+            <scope>runtime</scope>
         </dependency>
         <dependency>
             <groupId>junit</groupId>

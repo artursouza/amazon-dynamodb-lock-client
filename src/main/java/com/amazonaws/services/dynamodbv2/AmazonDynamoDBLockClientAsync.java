@@ -270,8 +270,8 @@ public class AmazonDynamoDBLockClientAsync implements Closeable, LockItemOwner {
                 || options.getAdditionalAttributes().containsKey(LEASE_DURATION)
                 || options.getAdditionalAttributes().containsKey(RECORD_VERSION_NUMBER)
                 || options.getAdditionalAttributes().containsKey(DATA)
-                || (this.sortKeyName.isPresent()
-                        && options.getAdditionalAttributes().containsKey(this.sortKeyName.get()))) {
+                || this.sortKeyName.isPresent()
+                        && options.getAdditionalAttributes().containsKey(this.sortKeyName.get())) {
             throw new IllegalArgumentException("Additional attribute cannot be one of the reserved lock attributes");
         }
 
@@ -1026,23 +1026,9 @@ public class AmazonDynamoDBLockClientAsync implements Closeable, LockItemOwner {
                     : PK_EXISTS_AND_IS_RELEASED_CONDITION;
         }
 
-        if (options.getUpdateExistingLockRecord()) {
-            item.remove(partitionKeyName);
-            sortKeyName.ifPresent(item::remove);
-            final String updateExpr = buildUpdateExpression(item, exprNames, exprValues)
-                    + REMOVE_IS_RELEASED_UPDATE_EXPRESSION;
-            return updateItemAndStartSessionMonitorAsync(options, key, sortKey, deleteLockOnRelease,
-                    sessionMonitor, newLockData, recordVersionNumber,
-                    UpdateItemRequest.builder().tableName(tableName).key(getItemKeys(existingLock.get()))
-                            .updateExpression(updateExpr).expressionAttributeNames(exprNames)
-                            .expressionAttributeValues(exprValues).conditionExpression(condExpr).build());
-        } else {
-            return putLockItemAndStartSessionMonitorAsync(options, key, sortKey, deleteLockOnRelease,
-                    sessionMonitor, newLockData, recordVersionNumber,
-                    PutItemRequest.builder().item(item).tableName(tableName)
-                            .conditionExpression(condExpr).expressionAttributeNames(exprNames)
-                            .expressionAttributeValues(exprValues).build());
-        }
+        return upsertOrPutExistingLockAsync(options, key, sortKey, deleteLockOnRelease, sessionMonitor,
+                existingLock, newLockData, item, recordVersionNumber,
+                REMOVE_IS_RELEASED_UPDATE_EXPRESSION, exprNames, exprValues, condExpr);
     }
 
     private CompletableFuture<LockItem> upsertAndMonitorExpiredLockAsync(
@@ -1065,22 +1051,39 @@ public class AmazonDynamoDBLockClientAsync implements Closeable, LockItemOwner {
             condExpr = PK_EXISTS_AND_RVN_IS_THE_SAME_CONDITION;
         }
 
+        return upsertOrPutExistingLockAsync(options, key, sortKey, deleteLockOnRelease, sessionMonitor,
+                existingLock, newLockData, item, recordVersionNumber,
+                "", exprNames, exprValues, condExpr);
+    }
+
+    /**
+     * Shared terminal step for released-lock and expired-lock acquisition paths.
+     * When {@code updateExistingLockRecord} is true, issues an UpdateItem with
+     * {@code baseUpdateExpr + extraUpdateExpr}; otherwise issues a PutItem.
+     */
+    private CompletableFuture<LockItem> upsertOrPutExistingLockAsync(
+            AcquireLockOptions options, String key, Optional<String> sortKey,
+            boolean deleteLockOnRelease, Optional<SessionMonitor> sessionMonitor,
+            Optional<LockItem> existingLock, Optional<ByteBuffer> newLockData,
+            Map<String, AttributeValue> item, String recordVersionNumber,
+            String extraUpdateExpr,
+            Map<String, String> exprNames, Map<String, AttributeValue> exprValues,
+            String condExpr) {
         if (options.getUpdateExistingLockRecord()) {
             item.remove(partitionKeyName);
             sortKeyName.ifPresent(item::remove);
-            final String updateExpr = buildUpdateExpression(item, exprNames, exprValues);
+            final String updateExpr = buildUpdateExpression(item, exprNames, exprValues) + extraUpdateExpr;
             return updateItemAndStartSessionMonitorAsync(options, key, sortKey, deleteLockOnRelease,
                     sessionMonitor, newLockData, recordVersionNumber,
                     UpdateItemRequest.builder().tableName(tableName).key(getItemKeys(existingLock.get()))
                             .updateExpression(updateExpr).expressionAttributeNames(exprNames)
                             .expressionAttributeValues(exprValues).conditionExpression(condExpr).build());
-        } else {
-            return putLockItemAndStartSessionMonitorAsync(options, key, sortKey, deleteLockOnRelease,
-                    sessionMonitor, newLockData, recordVersionNumber,
-                    PutItemRequest.builder().item(item).tableName(tableName)
-                            .conditionExpression(condExpr).expressionAttributeNames(exprNames)
-                            .expressionAttributeValues(exprValues).build());
         }
+        return putLockItemAndStartSessionMonitorAsync(options, key, sortKey, deleteLockOnRelease,
+                sessionMonitor, newLockData, recordVersionNumber,
+                PutItemRequest.builder().item(item).tableName(tableName)
+                        .conditionExpression(condExpr).expressionAttributeNames(exprNames)
+                        .expressionAttributeValues(exprValues).build());
     }
 
     private CompletableFuture<LockItem> putLockItemAndStartSessionMonitorAsync(
