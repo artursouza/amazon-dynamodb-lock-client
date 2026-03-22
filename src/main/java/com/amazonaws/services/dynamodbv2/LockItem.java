@@ -34,7 +34,7 @@ import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
  * @author <a href="mailto:slutsker@amazon.com">Sasha Slutsker</a>
  */
 public class LockItem implements Closeable {
-    private final AmazonDynamoDBLockClient client;
+    private final LockItemOwner client;
     private final String partitionKey;
     private final Optional<String> sortKey;
 
@@ -73,7 +73,7 @@ public class LockItem implements Closeable {
      * @param additionalAttributes          Additional attributes that can optionally be stored alongside
      *                                      the lock
      */
-    LockItem(final AmazonDynamoDBLockClient client, final String partitionKey, final Optional<String> sortKey, final Optional<ByteBuffer> data, final boolean deleteLockItemOnClose,
+    LockItem(final LockItemOwner client, final String partitionKey, final Optional<String> sortKey, final Optional<ByteBuffer> data, final boolean deleteLockItemOnClose,
         final String ownerName, final long leaseDuration, final long lastUpdatedTimeInMilliseconds, final String recordVersionNumber, final boolean isReleased,
         final Optional<SessionMonitor> sessionMonitor, final Map<String, AttributeValue> additionalAttributes) {
         Objects.requireNonNull(partitionKey, "Cannot create a lock with a null key");

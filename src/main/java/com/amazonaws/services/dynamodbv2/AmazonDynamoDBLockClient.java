@@ -137,7 +137,7 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
  * @author <a href="mailto:amcp@amazon.com">Alexander Patrikalakis</a>
  */
 @ThreadSafe
-public class AmazonDynamoDBLockClient implements Runnable, Closeable {
+public class AmazonDynamoDBLockClient implements Runnable, Closeable, LockItemOwner {
     private static final Log logger = LogFactory.getLog(AmazonDynamoDBLockClient.class);
     private static final Set<TableStatus> availableStatuses;
     protected static final String SK_PATH_EXPRESSION_VARIABLE = "#sk";

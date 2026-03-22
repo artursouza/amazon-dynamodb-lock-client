@@ -1,0 +1,1210 @@
+/*
+ * Copyright 2019 Amazon.com, Inc. or its affiliates.
+ * Licensed under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.amazonaws.services.dynamodbv2;
+
+import com.amazonaws.services.dynamodbv2.model.LockCurrentlyUnavailableException;
+import com.amazonaws.services.dynamodbv2.model.LockNotGrantedException;
+import com.amazonaws.services.dynamodbv2.model.LockTableDoesNotExistException;
+import com.amazonaws.services.dynamodbv2.util.LockClientUtils;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import software.amazon.awssdk.annotations.ThreadSafe;
+import software.amazon.awssdk.awscore.exception.AwsServiceException;
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.core.exception.SdkClientException;
+import software.amazon.awssdk.http.HttpStatusCode;
+import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
+import software.amazon.awssdk.services.dynamodb.model.AttributeDefinition;
+import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
+import software.amazon.awssdk.services.dynamodb.model.ConditionalCheckFailedException;
+import software.amazon.awssdk.services.dynamodb.model.CreateTableRequest;
+import software.amazon.awssdk.services.dynamodb.model.DeleteItemRequest;
+import software.amazon.awssdk.services.dynamodb.model.DescribeTableRequest;
+import software.amazon.awssdk.services.dynamodb.model.GetItemRequest;
+import software.amazon.awssdk.services.dynamodb.model.KeySchemaElement;
+import software.amazon.awssdk.services.dynamodb.model.KeyType;
+import software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughput;
+import software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughputExceededException;
+import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
+import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
+import software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException;
+import software.amazon.awssdk.services.dynamodb.model.ScalarAttributeType;
+import software.amazon.awssdk.services.dynamodb.model.ScanRequest;
+import software.amazon.awssdk.services.dynamodb.model.TableStatus;
+import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
+
+import java.io.Closeable;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+
+/**
+ * Async version of the DynamoDB lock client. All DynamoDB operations return
+ * {@link CompletableFuture}; no thread is ever blocked waiting on network I/O.
+ *
+ * <p>Heartbeating and session monitors run on a shared {@link ScheduledExecutorService}.
+ * The acquire-lock polling loop schedules retries on the same executor instead of
+ * calling {@code Thread.sleep}.
+ *
+ * <p>This class is thread-safe.
+ */
+@ThreadSafe
+public class AmazonDynamoDBLockClientAsync implements Closeable, LockItemOwner {
+
+    private static final Log logger = LogFactory.getLog(AmazonDynamoDBLockClientAsync.class);
+
+    private static final Set<TableStatus> AVAILABLE_STATUSES = new HashSet<>();
+    static {
+        AVAILABLE_STATUSES.add(TableStatus.ACTIVE);
+        AVAILABLE_STATUSES.add(TableStatus.UPDATING);
+    }
+
+    // Expression constants (mirrors AmazonDynamoDBLockClient)
+    private static final String SK_PATH_EXPRESSION_VARIABLE = "#sk";
+    private static final String PK_PATH_EXPRESSION_VARIABLE = "#pk";
+    private static final String PK_VALUE_EXPRESSION_VARIABLE = ":pk";
+    private static final String NEW_RVN_VALUE_EXPRESSION_VARIABLE = ":newRvn";
+    private static final String LEASE_DURATION_PATH_VALUE_EXPRESSION_VARIABLE = "#ld";
+    private static final String LEASE_DURATION_VALUE_EXPRESSION_VARIABLE = ":ld";
+    private static final String RVN_PATH_EXPRESSION_VARIABLE = "#rvn";
+    private static final String RVN_VALUE_EXPRESSION_VARIABLE = ":rvn";
+    private static final String OWNER_NAME_PATH_EXPRESSION_VARIABLE = "#on";
+    private static final String OWNER_NAME_VALUE_EXPRESSION_VARIABLE = ":on";
+    private static final String DATA_PATH_EXPRESSION_VARIABLE = "#d";
+    private static final String DATA_VALUE_EXPRESSION_VARIABLE = ":d";
+    private static final String IS_RELEASED_PATH_EXPRESSION_VARIABLE = "#ir";
+    private static final String IS_RELEASED_VALUE_EXPRESSION_VARIABLE = ":ir";
+
+    private static final String ACQUIRE_LOCK_THAT_DOESNT_EXIST_PK_CONDITION =
+            String.format("attribute_not_exists(%s)", PK_PATH_EXPRESSION_VARIABLE);
+    private static final String ACQUIRE_LOCK_THAT_DOESNT_EXIST_PK_SK_CONDITION =
+            String.format("attribute_not_exists(%s) AND attribute_not_exists(%s)",
+                    PK_PATH_EXPRESSION_VARIABLE, SK_PATH_EXPRESSION_VARIABLE);
+    private static final String PK_EXISTS_AND_IS_RELEASED_CONDITION =
+            String.format("attribute_exists(%s) AND %s = %s",
+                    PK_PATH_EXPRESSION_VARIABLE, IS_RELEASED_PATH_EXPRESSION_VARIABLE, IS_RELEASED_VALUE_EXPRESSION_VARIABLE);
+    private static final String PK_EXISTS_AND_SK_EXISTS_AND_IS_RELEASED_CONDITION =
+            String.format("attribute_exists(%s) AND attribute_exists(%s) AND %s = %s",
+                    PK_PATH_EXPRESSION_VARIABLE, SK_PATH_EXPRESSION_VARIABLE,
+                    IS_RELEASED_PATH_EXPRESSION_VARIABLE, IS_RELEASED_VALUE_EXPRESSION_VARIABLE);
+    private static final String PK_EXISTS_AND_SK_EXISTS_AND_RVN_IS_THE_SAME_AND_IS_RELEASED_CONDITION =
+            String.format("attribute_exists(%s) AND attribute_exists(%s) AND %s = %s AND %s = %s",
+                    PK_PATH_EXPRESSION_VARIABLE, SK_PATH_EXPRESSION_VARIABLE,
+                    RVN_PATH_EXPRESSION_VARIABLE, RVN_VALUE_EXPRESSION_VARIABLE,
+                    IS_RELEASED_PATH_EXPRESSION_VARIABLE, IS_RELEASED_VALUE_EXPRESSION_VARIABLE);
+    private static final String PK_EXISTS_AND_SK_EXISTS_AND_RVN_IS_THE_SAME_CONDITION =
+            String.format("attribute_exists(%s) AND attribute_exists(%s) AND %s = %s",
+                    PK_PATH_EXPRESSION_VARIABLE, SK_PATH_EXPRESSION_VARIABLE,
+                    RVN_PATH_EXPRESSION_VARIABLE, RVN_VALUE_EXPRESSION_VARIABLE);
+    private static final String PK_EXISTS_AND_SK_EXISTS_AND_OWNER_NAME_SAME_AND_RVN_SAME_CONDITION =
+            String.format("%s AND %s = %s",
+                    PK_EXISTS_AND_SK_EXISTS_AND_RVN_IS_THE_SAME_CONDITION,
+                    OWNER_NAME_PATH_EXPRESSION_VARIABLE, OWNER_NAME_VALUE_EXPRESSION_VARIABLE);
+    private static final String PK_EXISTS_AND_RVN_IS_THE_SAME_AND_IS_RELEASED_CONDITION =
+            String.format("(attribute_exists(%s) AND %s = %s AND %s = %s)",
+                    PK_PATH_EXPRESSION_VARIABLE,
+                    RVN_PATH_EXPRESSION_VARIABLE, RVN_VALUE_EXPRESSION_VARIABLE,
+                    IS_RELEASED_PATH_EXPRESSION_VARIABLE, IS_RELEASED_VALUE_EXPRESSION_VARIABLE);
+    private static final String PK_EXISTS_AND_RVN_IS_THE_SAME_CONDITION =
+            String.format("attribute_exists(%s) AND %s = %s",
+                    PK_PATH_EXPRESSION_VARIABLE, RVN_PATH_EXPRESSION_VARIABLE, RVN_VALUE_EXPRESSION_VARIABLE);
+    private static final String PK_EXISTS_AND_OWNER_NAME_SAME_AND_RVN_SAME_CONDITION =
+            String.format("%s AND %s = %s",
+                    PK_EXISTS_AND_RVN_IS_THE_SAME_CONDITION,
+                    OWNER_NAME_PATH_EXPRESSION_VARIABLE, OWNER_NAME_VALUE_EXPRESSION_VARIABLE);
+
+    private static final String UPDATE_IS_RELEASED =
+            String.format("SET %s = %s", IS_RELEASED_PATH_EXPRESSION_VARIABLE, IS_RELEASED_VALUE_EXPRESSION_VARIABLE);
+    private static final String UPDATE_IS_RELEASED_AND_DATA =
+            String.format("%s, %s = %s", UPDATE_IS_RELEASED, DATA_PATH_EXPRESSION_VARIABLE, DATA_VALUE_EXPRESSION_VARIABLE);
+    private static final String UPDATE_LEASE_DURATION_AND_RVN =
+            String.format("SET %s = %s, %s = %s",
+                    LEASE_DURATION_PATH_VALUE_EXPRESSION_VARIABLE, LEASE_DURATION_VALUE_EXPRESSION_VARIABLE,
+                    RVN_PATH_EXPRESSION_VARIABLE, NEW_RVN_VALUE_EXPRESSION_VARIABLE);
+    private static final String UPDATE_LEASE_DURATION_AND_RVN_AND_REMOVE_DATA =
+            String.format("%s REMOVE %s", UPDATE_LEASE_DURATION_AND_RVN, DATA_PATH_EXPRESSION_VARIABLE);
+    private static final String UPDATE_LEASE_DURATION_AND_RVN_AND_DATA =
+            String.format("%s, %s = %s", UPDATE_LEASE_DURATION_AND_RVN, DATA_PATH_EXPRESSION_VARIABLE, DATA_VALUE_EXPRESSION_VARIABLE);
+    private static final String REMOVE_IS_RELEASED_UPDATE_EXPRESSION =
+            String.format(" REMOVE %s ", IS_RELEASED_PATH_EXPRESSION_VARIABLE);
+    private static final String QUERY_PK_EXPRESSION =
+            String.format("%s = %s", PK_PATH_EXPRESSION_VARIABLE, PK_VALUE_EXPRESSION_VARIABLE);
+
+    private static final String DATA = "data";
+    private static final String OWNER_NAME = "ownerName";
+    private static final String LEASE_DURATION = "leaseDuration";
+    private static final String RECORD_VERSION_NUMBER = "recordVersionNumber";
+    private static final String IS_RELEASED = "isReleased";
+    private static final String IS_RELEASED_VALUE = "1";
+    private static final AttributeValue IS_RELEASED_ATTRIBUTE_VALUE =
+            AttributeValue.builder().s(IS_RELEASED_VALUE).build();
+
+    private static final long DEFAULT_BUFFER_MS = 1000;
+
+    /** Sentinel thrown (never escaping the class) to signal "retry the poll loop". */
+    private static final class NeedToRetryException extends RuntimeException {
+        NeedToRetryException() { super(null, null, true, false); }
+    }
+    private static final NeedToRetryException NEED_TO_RETRY = new NeedToRetryException();
+
+    // -------------------------------------------------------------------------
+    // Instance fields
+    // -------------------------------------------------------------------------
+
+    private final DynamoDbAsyncClient dynamoDB;
+    private final String tableName;
+    private final String partitionKeyName;
+    private final Optional<String> sortKeyName;
+    private final long leaseDurationInMilliseconds;
+    private final long heartbeatPeriodInMilliseconds;
+    private final boolean holdLockOnServiceUnavailable;
+    private final String ownerName;
+
+    private final ConcurrentHashMap<String, LockItem> locks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, LockItem> notMyLocks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ScheduledFuture<?>> sessionMonitors = new ConcurrentHashMap<>();
+
+    private final ScheduledExecutorService scheduler;
+    /** True when the executor was created by this client and must be shut down on close. */
+    private final boolean ownsScheduler;
+    private volatile boolean shuttingDown = false;
+
+    // -------------------------------------------------------------------------
+    // Constructor
+    // -------------------------------------------------------------------------
+
+    public AmazonDynamoDBLockClientAsync(final AmazonDynamoDBLockClientAsyncOptions options) {
+        Objects.requireNonNull(options.getDynamoDBAsyncClient(), "DynamoDB async client cannot be null");
+        Objects.requireNonNull(options.getTableName(), "Table name cannot be null");
+        Objects.requireNonNull(options.getOwnerName(), "Owner name cannot be null");
+        Objects.requireNonNull(options.getTimeUnit(), "Time unit cannot be null");
+        Objects.requireNonNull(options.getPartitionKeyName(), "Partition key name cannot be null");
+        Objects.requireNonNull(options.getSortKeyName(), "Sort key name cannot be null (use Optional.empty())");
+
+        this.dynamoDB = options.getDynamoDBAsyncClient();
+        this.tableName = options.getTableName();
+        this.ownerName = options.getOwnerName();
+        this.leaseDurationInMilliseconds = options.getTimeUnit().toMillis(options.getLeaseDuration());
+        this.heartbeatPeriodInMilliseconds = options.getTimeUnit().toMillis(options.getHeartbeatPeriod());
+        this.partitionKeyName = options.getPartitionKeyName();
+        this.sortKeyName = options.getSortKeyName();
+        this.holdLockOnServiceUnavailable = options.getHoldLockOnServiceUnavailable();
+
+        if (options.getHeartbeatExecutor().isPresent()) {
+            this.scheduler = options.getHeartbeatExecutor().get();
+            this.ownsScheduler = false;
+        } else {
+            this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "dynamodb-lock-client-async-scheduler");
+                t.setDaemon(true);
+                return t;
+            });
+            this.ownsScheduler = true;
+        }
+
+        if (options.getCreateHeartbeatBackgroundThread()) {
+            if (this.leaseDurationInMilliseconds < 2 * this.heartbeatPeriodInMilliseconds) {
+                throw new IllegalArgumentException(
+                        "Heartbeat period must be no more than half the length of the Lease Duration");
+            }
+            scheduleNextHeartbeatRound(0L);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Public async API
+    // -------------------------------------------------------------------------
+
+    /**
+     * Asynchronously acquires a lock, polling DynamoDB until the lock is obtained
+     * or {@code additionalTimeToWaitForLock} elapses. No thread is blocked during
+     * the wait; retries are scheduled on the internal {@link ScheduledExecutorService}.
+     */
+    public CompletableFuture<LockItem> acquireLockAsync(final AcquireLockOptions options) {
+        Objects.requireNonNull(options, "Cannot acquire lock when options is null");
+        Objects.requireNonNull(options.getPartitionKey(), "Cannot acquire lock when key is null");
+
+        final String key = options.getPartitionKey();
+        final Optional<String> sortKey = options.getSortKey();
+
+        if (options.getReentrant() && hasLock(key, sortKey)) {
+            final LockItem local = this.locks.get(key + sortKey.orElse(""));
+            if (local != null && !local.isExpired()) {
+                return CompletableFuture.completedFuture(local);
+            }
+        }
+
+        if (options.getAdditionalAttributes().containsKey(this.partitionKeyName)
+                || options.getAdditionalAttributes().containsKey(OWNER_NAME)
+                || options.getAdditionalAttributes().containsKey(LEASE_DURATION)
+                || options.getAdditionalAttributes().containsKey(RECORD_VERSION_NUMBER)
+                || options.getAdditionalAttributes().containsKey(DATA)
+                || (this.sortKeyName.isPresent()
+                        && options.getAdditionalAttributes().containsKey(this.sortKeyName.get()))) {
+            throw new IllegalArgumentException("Additional attribute cannot be one of the reserved lock attributes");
+        }
+
+        long millisecondsToWait = DEFAULT_BUFFER_MS;
+        if (options.getAdditionalTimeToWaitForLock() != null) {
+            Objects.requireNonNull(options.getTimeUnit(), "timeUnit must not be null if additionalTimeToWaitForLock is non-null");
+            millisecondsToWait = options.getTimeUnit().toMillis(options.getAdditionalTimeToWaitForLock());
+        }
+        long refreshPeriodMs = DEFAULT_BUFFER_MS;
+        if (options.getRefreshPeriod() != null) {
+            Objects.requireNonNull(options.getTimeUnit(), "timeUnit must not be null if refreshPeriod is non-null");
+            refreshPeriodMs = options.getTimeUnit().toMillis(options.getRefreshPeriod());
+        }
+
+        final Optional<SessionMonitor> sessionMonitor = options.getSessionMonitor();
+        if (sessionMonitor.isPresent()) {
+            sessionMonitorArgsValidate(sessionMonitor.get().getSafeTimeMillis(),
+                    this.heartbeatPeriodInMilliseconds, this.leaseDurationInMilliseconds);
+        }
+
+        final boolean deleteLockOnRelease = options.getDeleteLockOnRelease();
+        final long startTimeMs = LockClientUtils.INSTANCE.millisecondTime();
+        final AtomicLong mutableMsToWait = new AtomicLong(millisecondsToWait);
+        final AtomicReference<LockItem> lockTryingToBeAcquired = new AtomicReference<>(null);
+        final AtomicBoolean alreadySleptOnce = new AtomicBoolean(false);
+        final GetLockOptions getLockOptions = new GetLockOptions.GetLockOptionsBuilder(key)
+                .withSortKey(sortKey.orElse(null))
+                .withDeleteLockOnRelease(deleteLockOnRelease)
+                .build();
+        final long finalRefreshPeriodMs = refreshPeriodMs;
+
+        final CompletableFuture<LockItem> promise = new CompletableFuture<>();
+        runAcquireIteration(promise, options, key, sortKey, startTimeMs, mutableMsToWait,
+                finalRefreshPeriodMs, lockTryingToBeAcquired, alreadySleptOnce,
+                getLockOptions, deleteLockOnRelease, sessionMonitor);
+        return promise;
+    }
+
+    private void runAcquireIteration(
+            CompletableFuture<LockItem> promise, AcquireLockOptions options,
+            String key, Optional<String> sortKey,
+            long startTimeMs, AtomicLong mutableMsToWait, long refreshPeriodMs,
+            AtomicReference<LockItem> lockTryingToBeAcquired, AtomicBoolean alreadySleptOnce,
+            GetLockOptions getLockOptions, boolean deleteLockOnRelease,
+            Optional<SessionMonitor> sessionMonitor) {
+
+        if (promise.isDone()) {
+            return;
+        }
+
+        getLockFromDynamoDBAsync(getLockOptions)
+                .thenCompose(existingLock -> handleAcquireWithExistingLock(
+                        existingLock, options, key, sortKey,
+                        mutableMsToWait, lockTryingToBeAcquired, alreadySleptOnce,
+                        deleteLockOnRelease, sessionMonitor))
+                .whenComplete((acquired, ex) -> {
+                    if (promise.isDone()) {
+                        return;
+                    }
+                    if (ex == null) {
+                        promise.complete(acquired);
+                        return;
+                    }
+
+                    Throwable cause = unwrap(ex);
+                    // Convert DDB-level failures to LockNotGrantedException where appropriate
+                    if (cause instanceof ConditionalCheckFailedException) {
+                        logger.debug("Someone else acquired the lock", cause);
+                        cause = new LockNotGrantedException("Could not acquire lock because someone else acquired it: ", cause);
+                    } else if (cause instanceof ProvisionedThroughputExceededException) {
+                        logger.debug("Provisioned throughput exceeded", cause);
+                        cause = new LockNotGrantedException("Could not acquire lock because provisioned throughput exceeded", cause);
+                    }
+
+                    final long elapsed = LockClientUtils.INSTANCE.millisecondTime() - startTimeMs;
+                    final boolean timedOut = elapsed > mutableMsToWait.get();
+
+                    if (cause instanceof SdkClientException) {
+                        logger.warn("Could not acquire lock because of a client side failure in talking to DDB", cause);
+                        // Retry unless timed out
+                    } else if (cause instanceof LockNotGrantedException || cause instanceof NeedToRetryException) {
+                        if (timedOut) {
+                            promise.completeExceptionally(cause instanceof NeedToRetryException
+                                    ? new LockNotGrantedException("Didn't acquire lock after sleeping for " + elapsed + " milliseconds")
+                                    : cause);
+                            return;
+                        }
+                        // else: retry
+                    } else {
+                        promise.completeExceptionally(cause);
+                        return;
+                    }
+
+                    if (timedOut) {
+                        promise.completeExceptionally(new LockNotGrantedException(
+                                "Didn't acquire lock after sleeping for " + elapsed + " milliseconds"));
+                        return;
+                    }
+
+                    logger.trace("Scheduling acquire retry after " + refreshPeriodMs + " ms");
+                    scheduler.schedule(() -> runAcquireIteration(promise, options, key, sortKey,
+                            startTimeMs, mutableMsToWait, refreshPeriodMs,
+                            lockTryingToBeAcquired, alreadySleptOnce,
+                            getLockOptions, deleteLockOnRelease, sessionMonitor),
+                            refreshPeriodMs, TimeUnit.MILLISECONDS);
+                });
+    }
+
+    private CompletableFuture<LockItem> handleAcquireWithExistingLock(
+            Optional<LockItem> existingLock, AcquireLockOptions options,
+            String key, Optional<String> sortKey,
+            AtomicLong mutableMsToWait, AtomicReference<LockItem> lockTryingToBeAcquired,
+            AtomicBoolean alreadySleptOnce, boolean deleteLockOnRelease,
+            Optional<SessionMonitor> sessionMonitor) {
+
+        if (options.getAcquireOnlyIfLockAlreadyExists() && !existingLock.isPresent()) {
+            return failedFuture(new LockNotGrantedException("Lock does not exist."));
+        }
+
+        if (options.shouldSkipBlockingWait() && existingLock.isPresent() && !existingLock.get().isExpired()) {
+            final String id = existingLock.get().getUniqueIdentifier();
+            boolean isReallyExpired = false;
+            if (notMyLocks.containsKey(id)
+                    && notMyLocks.get(id).getRecordVersionNumber().equals(existingLock.get().getRecordVersionNumber())) {
+                isReallyExpired = notMyLocks.get(id).isExpired();
+                if (isReallyExpired) {
+                    lockTryingToBeAcquired.set(notMyLocks.get(id));
+                }
+            } else {
+                notMyLocks.put(id, existingLock.get());
+            }
+            if (!isReallyExpired) {
+                return failedFuture(new LockCurrentlyUnavailableException(
+                        "The lock being requested is being held by another client."));
+            }
+        }
+
+        final boolean replaceData = options.getReplaceData();
+        Optional<ByteBuffer> newLockData = Optional.empty();
+        if (replaceData) {
+            newLockData = options.getData();
+        } else if (existingLock.isPresent()) {
+            newLockData = existingLock.get().getData();
+        }
+        if (!newLockData.isPresent()) {
+            newLockData = options.getData();
+        }
+
+        final Map<String, AttributeValue> item = new HashMap<>(options.getAdditionalAttributes());
+        item.put(this.partitionKeyName, AttributeValue.builder().s(key).build());
+        item.put(OWNER_NAME, AttributeValue.builder().s(this.ownerName).build());
+        item.put(LEASE_DURATION, AttributeValue.builder().s(String.valueOf(this.leaseDurationInMilliseconds)).build());
+        final String recordVersionNumber = generateRecordVersionNumber();
+        item.put(RECORD_VERSION_NUMBER, AttributeValue.builder().s(recordVersionNumber).build());
+        this.sortKeyName.ifPresent(sk -> item.put(sk, AttributeValue.builder().s(sortKey.get()).build()));
+        final Optional<ByteBuffer> finalNewLockData = newLockData;
+        finalNewLockData.ifPresent(bb -> item.put(DATA, AttributeValue.builder().b(SdkBytes.fromByteBuffer(bb)).build()));
+
+        if (!existingLock.isPresent() && !options.getAcquireOnlyIfLockAlreadyExists()) {
+            return upsertAndMonitorNewLockAsync(options, key, sortKey, deleteLockOnRelease,
+                    sessionMonitor, finalNewLockData, item, recordVersionNumber);
+        } else if (existingLock.isPresent() && existingLock.get().isReleased()) {
+            return upsertAndMonitorReleasedLockAsync(options, key, sortKey, deleteLockOnRelease,
+                    sessionMonitor, existingLock, finalNewLockData, item, recordVersionNumber);
+        }
+
+        final LockItem ltba = lockTryingToBeAcquired.get();
+        if (ltba == null) {
+            lockTryingToBeAcquired.set(existingLock.get());
+            if (!alreadySleptOnce.getAndSet(true)) {
+                mutableMsToWait.addAndGet(existingLock.get().getLeaseDuration());
+            }
+            return failedFuture(NEED_TO_RETRY);
+        } else {
+            if (ltba.getRecordVersionNumber().equals(existingLock.get().getRecordVersionNumber())) {
+                if (ltba.isExpired()) {
+                    return upsertAndMonitorExpiredLockAsync(options, key, sortKey, deleteLockOnRelease,
+                            sessionMonitor, existingLock, finalNewLockData, item, recordVersionNumber);
+                }
+            } else {
+                lockTryingToBeAcquired.set(existingLock.get());
+            }
+            return failedFuture(NEED_TO_RETRY);
+        }
+    }
+
+    /**
+     * Attempts to acquire a lock, returning an empty {@link Optional} instead of
+     * throwing if the lock cannot be granted.
+     */
+    public CompletableFuture<Optional<LockItem>> tryAcquireLockAsync(final AcquireLockOptions options) {
+        return acquireLockAsync(options)
+                .thenApply(Optional::of)
+                .exceptionally(ex -> {
+                    if (unwrap(ex) instanceof LockNotGrantedException) {
+                        return Optional.empty();
+                    }
+                    if (ex instanceof RuntimeException) throw (RuntimeException) ex;
+                    throw new RuntimeException(ex);
+                });
+    }
+
+    /**
+     * Returns true if this client currently holds the lock for the given key.
+     */
+    public boolean hasLock(final String key, final Optional<String> sortKey) {
+        Objects.requireNonNull(sortKey, "Sort Key must not be null (can be Optional.empty())");
+        final LockItem local = this.locks.get(key + sortKey.orElse(""));
+        return local != null && !local.isExpired();
+    }
+
+    /** Releases the lock, deleting or marking it as released per the lock's own setting. */
+    public CompletableFuture<Boolean> releaseLockAsync(final LockItem lockItem) {
+        return releaseLockAsync(ReleaseLockOptions.builder(lockItem)
+                .withDeleteLock(lockItem.getDeleteLockItemOnClose()).build());
+    }
+
+    public CompletableFuture<Boolean> releaseLockAsync(final ReleaseLockOptions options) {
+        Objects.requireNonNull(options, "ReleaseLockOptions cannot be null");
+        final LockItem lockItem = options.getLockItem();
+        Objects.requireNonNull(lockItem, "Cannot release null lockItem");
+
+        if (!lockItem.getOwnerName().equals(this.ownerName)) {
+            return CompletableFuture.completedFuture(false);
+        }
+
+        // Remove from heartbeat map immediately — mirrors sync client behaviour.
+        this.locks.remove(lockItem.getUniqueIdentifier());
+
+        final boolean deleteLock = options.isDeleteLock();
+        final boolean bestEffort = options.isBestEffort();
+        final Optional<ByteBuffer> data = options.getData();
+
+        final Map<String, AttributeValue> expressionAttributeValues = new HashMap<>();
+        final Map<String, String> expressionAttributeNames = new HashMap<>();
+        final String conditionalExpression;
+        final Map<String, AttributeValue> itemKey;
+
+        synchronized (lockItem) {
+            expressionAttributeValues.put(RVN_VALUE_EXPRESSION_VARIABLE,
+                    AttributeValue.builder().s(lockItem.getRecordVersionNumber()).build());
+            expressionAttributeValues.put(OWNER_NAME_VALUE_EXPRESSION_VARIABLE,
+                    AttributeValue.builder().s(lockItem.getOwnerName()).build());
+            expressionAttributeNames.put(PK_PATH_EXPRESSION_VARIABLE, partitionKeyName);
+            expressionAttributeNames.put(OWNER_NAME_PATH_EXPRESSION_VARIABLE, OWNER_NAME);
+            expressionAttributeNames.put(RVN_PATH_EXPRESSION_VARIABLE, RECORD_VERSION_NUMBER);
+            if (this.sortKeyName.isPresent()) {
+                conditionalExpression = PK_EXISTS_AND_SK_EXISTS_AND_OWNER_NAME_SAME_AND_RVN_SAME_CONDITION;
+                expressionAttributeNames.put(SK_PATH_EXPRESSION_VARIABLE, sortKeyName.get());
+            } else {
+                conditionalExpression = PK_EXISTS_AND_OWNER_NAME_SAME_AND_RVN_SAME_CONDITION;
+            }
+            itemKey = getItemKeys(lockItem);
+        }
+
+        final CompletableFuture<Void> ddbCall;
+        if (deleteLock) {
+            ddbCall = this.dynamoDB.deleteItem(DeleteItemRequest.builder()
+                    .tableName(tableName).key(itemKey)
+                    .conditionExpression(conditionalExpression)
+                    .expressionAttributeNames(expressionAttributeNames)
+                    .expressionAttributeValues(expressionAttributeValues).build())
+                    .thenAccept(r -> { });
+        } else {
+            expressionAttributeNames.put(IS_RELEASED_PATH_EXPRESSION_VARIABLE, IS_RELEASED);
+            expressionAttributeValues.put(IS_RELEASED_VALUE_EXPRESSION_VARIABLE, IS_RELEASED_ATTRIBUTE_VALUE);
+            final String updateExpression;
+            if (data.isPresent()) {
+                updateExpression = UPDATE_IS_RELEASED_AND_DATA;
+                expressionAttributeNames.put(DATA_PATH_EXPRESSION_VARIABLE, DATA);
+                expressionAttributeValues.put(DATA_VALUE_EXPRESSION_VARIABLE,
+                        AttributeValue.builder().b(SdkBytes.fromByteBuffer(data.get())).build());
+            } else {
+                updateExpression = UPDATE_IS_RELEASED;
+            }
+            ddbCall = this.dynamoDB.updateItem(UpdateItemRequest.builder()
+                    .tableName(tableName).key(itemKey)
+                    .updateExpression(updateExpression)
+                    .conditionExpression(conditionalExpression)
+                    .expressionAttributeNames(expressionAttributeNames)
+                    .expressionAttributeValues(expressionAttributeValues).build())
+                    .thenAccept(r -> { });
+        }
+
+        return ddbCall
+                .thenApply(v -> {
+                    removeKillSessionMonitor(lockItem.getUniqueIdentifier());
+                    return true;
+                })
+                .exceptionally(ex -> {
+                    final Throwable cause = unwrap(ex);
+                    if (cause instanceof ConditionalCheckFailedException) {
+                        logger.debug("Someone else acquired the lock before you asked to release it", cause);
+                        return false;
+                    }
+                    if (cause instanceof SdkClientException && bestEffort) {
+                        logger.warn("Ignoring SdkClientException on best-effort release", cause);
+                        removeKillSessionMonitor(lockItem.getUniqueIdentifier());
+                        return true;
+                    }
+                    if (ex instanceof RuntimeException) throw (RuntimeException) ex;
+                    throw new RuntimeException(ex);
+                });
+    }
+
+    /** Sends a heartbeat for the given lock using default options. */
+    public CompletableFuture<Void> sendHeartbeatAsync(final LockItem lockItem) {
+        return sendHeartbeatAsync(SendHeartbeatOptions.builder(lockItem).build());
+    }
+
+    public CompletableFuture<Void> sendHeartbeatAsync(final SendHeartbeatOptions options) {
+        Objects.requireNonNull(options, "options is required");
+        Objects.requireNonNull(options.getLockItem(), "Cannot send heartbeat for null lock");
+
+        final boolean deleteData = options.getDeleteData() != null && options.getDeleteData();
+        if (deleteData && options.getData().isPresent()) {
+            throw new IllegalArgumentException("data must not be present if deleteData is true");
+        }
+
+        long leaseDurationMs = this.leaseDurationInMilliseconds;
+        if (options.getLeaseDurationToEnsure() != null) {
+            Objects.requireNonNull(options.getTimeUnit(), "TimeUnit must not be null if leaseDurationToEnsure is not null");
+            leaseDurationMs = options.getTimeUnit().toMillis(options.getLeaseDurationToEnsure());
+        }
+        final long finalLeaseDurationMs = leaseDurationMs;
+
+        final LockItem lockItem = options.getLockItem();
+        if (lockItem.isExpired() || !lockItem.getOwnerName().equals(this.ownerName) || lockItem.isReleased()) {
+            this.locks.remove(lockItem.getUniqueIdentifier());
+            return failedFuture(new LockNotGrantedException("Cannot send heartbeat because lock is not granted"));
+        }
+
+        final UpdateItemRequest updateItemRequest;
+        final String newRvn;
+
+        synchronized (lockItem) {
+            final Map<String, AttributeValue> exprValues = new HashMap<>();
+            exprValues.put(RVN_VALUE_EXPRESSION_VARIABLE, AttributeValue.builder().s(lockItem.getRecordVersionNumber()).build());
+            exprValues.put(OWNER_NAME_VALUE_EXPRESSION_VARIABLE, AttributeValue.builder().s(lockItem.getOwnerName()).build());
+            final Map<String, String> exprNames = new HashMap<>();
+            exprNames.put(PK_PATH_EXPRESSION_VARIABLE, partitionKeyName);
+            exprNames.put(LEASE_DURATION_PATH_VALUE_EXPRESSION_VARIABLE, LEASE_DURATION);
+            exprNames.put(RVN_PATH_EXPRESSION_VARIABLE, RECORD_VERSION_NUMBER);
+            exprNames.put(OWNER_NAME_PATH_EXPRESSION_VARIABLE, OWNER_NAME);
+            final String condExpr;
+            if (this.sortKeyName.isPresent()) {
+                condExpr = PK_EXISTS_AND_SK_EXISTS_AND_OWNER_NAME_SAME_AND_RVN_SAME_CONDITION;
+                exprNames.put(SK_PATH_EXPRESSION_VARIABLE, sortKeyName.get());
+            } else {
+                condExpr = PK_EXISTS_AND_OWNER_NAME_SAME_AND_RVN_SAME_CONDITION;
+            }
+            newRvn = generateRecordVersionNumber();
+            exprValues.put(NEW_RVN_VALUE_EXPRESSION_VARIABLE, AttributeValue.builder().s(newRvn).build());
+            exprValues.put(LEASE_DURATION_VALUE_EXPRESSION_VARIABLE,
+                    AttributeValue.builder().s(String.valueOf(finalLeaseDurationMs)).build());
+            final String updateExpr;
+            if (deleteData) {
+                exprNames.put(DATA_PATH_EXPRESSION_VARIABLE, DATA);
+                updateExpr = UPDATE_LEASE_DURATION_AND_RVN_AND_REMOVE_DATA;
+            } else if (options.getData().isPresent()) {
+                exprNames.put(DATA_PATH_EXPRESSION_VARIABLE, DATA);
+                exprValues.put(DATA_VALUE_EXPRESSION_VARIABLE,
+                        AttributeValue.builder().b(SdkBytes.fromByteBuffer(options.getData().get())).build());
+                updateExpr = UPDATE_LEASE_DURATION_AND_RVN_AND_DATA;
+            } else {
+                updateExpr = UPDATE_LEASE_DURATION_AND_RVN;
+            }
+            updateItemRequest = UpdateItemRequest.builder()
+                    .tableName(tableName).key(getItemKeys(lockItem))
+                    .conditionExpression(condExpr).updateExpression(updateExpr)
+                    .expressionAttributeNames(exprNames).expressionAttributeValues(exprValues).build();
+        }
+
+        final long lastUpdate = LockClientUtils.INSTANCE.millisecondTime();
+        final String capturedRvn = newRvn;
+        final boolean capturedDeleteData = deleteData;
+
+        return this.dynamoDB.updateItem(updateItemRequest)
+                .thenAccept(resp -> {
+                    synchronized (lockItem) {
+                        lockItem.updateRecordVersionNumber(capturedRvn, lastUpdate, finalLeaseDurationMs);
+                        if (capturedDeleteData) {
+                            lockItem.updateData(null);
+                        } else if (options.getData().isPresent()) {
+                            lockItem.updateData(options.getData().get());
+                        }
+                    }
+                })
+                .exceptionally(ex -> {
+                    final Throwable cause = unwrap(ex);
+                    if (cause instanceof ConditionalCheckFailedException) {
+                        logger.debug("Someone else acquired the lock, so we will stop heartbeating it", cause);
+                        this.locks.remove(lockItem.getUniqueIdentifier());
+                        throw new RuntimeException(
+                                new LockNotGrantedException("Someone else acquired the lock, so we will stop heartbeating it", cause));
+                    }
+                    if (cause instanceof AwsServiceException) {
+                        final AwsServiceException aws = (AwsServiceException) cause;
+                        if (this.holdLockOnServiceUnavailable
+                                && aws.awsErrorDetails().sdkHttpResponse().statusCode() == HttpStatusCode.SERVICE_UNAVAILABLE) {
+                            logger.info("DynamoDB Service Unavailable. Holding the lock.");
+                            lockItem.updateLookUpTime(LockClientUtils.INSTANCE.millisecondTime());
+                            return null;
+                        }
+                    }
+                    if (ex instanceof RuntimeException) throw (RuntimeException) ex;
+                    throw new RuntimeException(ex);
+                });
+    }
+
+    /**
+     * Returns the lock if currently held locally or retrieves it from DynamoDB.
+     * Clears the RVN so callers cannot accidentally heartbeat a lock they don't own.
+     */
+    public CompletableFuture<Optional<LockItem>> getLockAsync(final String key, final Optional<String> sortKey) {
+        Objects.requireNonNull(sortKey, "Sort Key must not be null (can be Optional.empty())");
+        final LockItem local = this.locks.get(key + sortKey.orElse(""));
+        if (local != null) {
+            return CompletableFuture.completedFuture(Optional.of(local));
+        }
+        return getLockFromDynamoDBAsync(new GetLockOptions.GetLockOptionsBuilder(key)
+                .withSortKey(sortKey.orElse(null)).withDeleteLockOnRelease(false).build())
+                .thenApply(lockItem -> {
+                    if (!lockItem.isPresent()) {
+                        return Optional.<LockItem>empty();
+                    }
+                    if (lockItem.get().isReleased()) {
+                        return Optional.<LockItem>empty();
+                    }
+                    lockItem.get().updateRecordVersionNumber("", 0, lockItem.get().getLeaseDuration());
+                    return lockItem;
+                });
+    }
+
+    /** Reads a lock item directly from DynamoDB without acquiring it. */
+    public CompletableFuture<Optional<LockItem>> getLockFromDynamoDBAsync(final GetLockOptions options) {
+        Objects.requireNonNull(options, "GetLockOptions cannot be null");
+        Objects.requireNonNull(options.getPartitionKey(), "Cannot lookup null key");
+
+        final Map<String, AttributeValue> ddbKey = new HashMap<>();
+        ddbKey.put(this.partitionKeyName, AttributeValue.builder().s(options.getPartitionKey()).build());
+        if (this.sortKeyName.isPresent()) {
+            ddbKey.put(this.sortKeyName.get(),
+                    AttributeValue.builder().s(options.getSortKey().get()).build());
+        }
+        final GetItemRequest request = GetItemRequest.builder()
+                .tableName(tableName).key(ddbKey).consistentRead(true).build();
+
+        return this.dynamoDB.getItem(request).thenApply(response -> {
+            final Map<String, AttributeValue> item = response.item();
+            if (item == null || item.isEmpty()) {
+                return Optional.<LockItem>empty();
+            }
+            return Optional.of(createLockItem(options, item));
+        });
+    }
+
+    /** Returns all locks in the table as a list (fetches all pages). */
+    public CompletableFuture<List<LockItem>> getAllLocksFromDynamoDBAsync(final boolean deleteOnRelease) {
+        final ScanRequest request = ScanRequest.builder().tableName(this.tableName).build();
+        return scanAllPagesAsync(request, new ArrayList<>(), deleteOnRelease);
+    }
+
+    private CompletableFuture<List<LockItem>> scanAllPagesAsync(
+            final ScanRequest request, final List<LockItem> accumulated, final boolean deleteOnRelease) {
+        return this.dynamoDB.scan(request).thenCompose(response -> {
+            response.items().forEach(item -> {
+                final String key = item.get(this.partitionKeyName).s();
+                accumulated.add(buildLockItemFromScanResult(key, deleteOnRelease, item));
+            });
+            if (response.lastEvaluatedKey() != null && !response.lastEvaluatedKey().isEmpty()) {
+                return scanAllPagesAsync(request.toBuilder()
+                        .exclusiveStartKey(response.lastEvaluatedKey()).build(), accumulated, deleteOnRelease);
+            }
+            return CompletableFuture.completedFuture(accumulated);
+        });
+    }
+
+    /** Returns all locks for a given partition key as a list (fetches all pages). */
+    public CompletableFuture<List<LockItem>> getLocksByPartitionKeyAsync(
+            final String key, final boolean deleteOnRelease) {
+        final Map<String, String> exprNames = new HashMap<>();
+        exprNames.put(PK_PATH_EXPRESSION_VARIABLE, this.partitionKeyName);
+        final Map<String, AttributeValue> exprValues = new HashMap<>();
+        exprValues.put(PK_VALUE_EXPRESSION_VARIABLE, AttributeValue.builder().s(key).build());
+        final QueryRequest request = QueryRequest.builder()
+                .tableName(this.tableName)
+                .keyConditionExpression(QUERY_PK_EXPRESSION)
+                .expressionAttributeNames(exprNames)
+                .expressionAttributeValues(exprValues).build();
+        return queryAllPagesAsync(request, new ArrayList<>(), key, deleteOnRelease);
+    }
+
+    private CompletableFuture<List<LockItem>> queryAllPagesAsync(
+            final QueryRequest request, final List<LockItem> accumulated,
+            final String partitionKey, final boolean deleteOnRelease) {
+        return this.dynamoDB.query(request).thenCompose(response -> {
+            response.items().forEach(item ->
+                    accumulated.add(buildLockItemFromScanResult(partitionKey, deleteOnRelease, item)));
+            if (response.lastEvaluatedKey() != null && !response.lastEvaluatedKey().isEmpty()) {
+                return queryAllPagesAsync(request.toBuilder()
+                        .exclusiveStartKey(response.lastEvaluatedKey()).build(),
+                        accumulated, partitionKey, deleteOnRelease);
+            }
+            return CompletableFuture.completedFuture(accumulated);
+        });
+    }
+
+    public CompletableFuture<Boolean> lockTableExistsAsync() {
+        return this.dynamoDB.describeTable(DescribeTableRequest.builder().tableName(tableName).build())
+                .thenApply(r -> AVAILABLE_STATUSES.contains(r.table().tableStatus()))
+                .exceptionally(ex -> {
+                    if (unwrap(ex) instanceof ResourceNotFoundException) {
+                        return false;
+                    }
+                    if (ex instanceof RuntimeException) throw (RuntimeException) ex;
+                    throw new RuntimeException(ex);
+                });
+    }
+
+    public CompletableFuture<Void> assertLockTableExistsAsync() {
+        return lockTableExistsAsync()
+                .thenAccept(exists -> {
+                    if (!exists) {
+                        throw new RuntimeException(
+                                new LockTableDoesNotExistException("Lock table " + this.tableName + " does not exist"));
+                    }
+                })
+                .exceptionally(ex -> {
+                    final Throwable cause = unwrap(ex);
+                    if (cause instanceof LockTableDoesNotExistException) {
+                        if (ex instanceof RuntimeException) throw (RuntimeException) ex;
+                        throw new RuntimeException(ex);
+                    }
+                    throw new RuntimeException(
+                            new LockTableDoesNotExistException("Lock table " + this.tableName + " does not exist", cause));
+                });
+    }
+
+    /**
+     * Creates a DynamoDB table suitable for use with this lock client.
+     */
+    public static CompletableFuture<Void> createLockTableInDynamoDBAsync(
+            final DynamoDbAsyncClient dynamoDB,
+            final ProvisionedThroughput provisionedThroughput,
+            final String tableName,
+            final String partitionKeyName,
+            final Optional<String> sortKeyName) {
+        Objects.requireNonNull(dynamoDB, "DynamoDB client cannot be null");
+        Objects.requireNonNull(tableName, "Table name cannot be null");
+        Objects.requireNonNull(provisionedThroughput, "Provisioned throughput cannot be null");
+        Objects.requireNonNull(partitionKeyName, "Partition key name cannot be null");
+
+        final List<KeySchemaElement> keySchema = new ArrayList<>();
+        keySchema.add(KeySchemaElement.builder()
+                .attributeName(partitionKeyName).keyType(KeyType.HASH).build());
+        final Collection<AttributeDefinition> attrDefs = new ArrayList<>();
+        attrDefs.add(AttributeDefinition.builder()
+                .attributeName(partitionKeyName).attributeType(ScalarAttributeType.S).build());
+        if (sortKeyName.isPresent()) {
+            keySchema.add(KeySchemaElement.builder()
+                    .attributeName(sortKeyName.get()).keyType(KeyType.RANGE).build());
+            attrDefs.add(AttributeDefinition.builder()
+                    .attributeName(sortKeyName.get()).attributeType(ScalarAttributeType.S).build());
+        }
+        return dynamoDB.createTable(CreateTableRequest.builder()
+                .tableName(tableName).keySchema(keySchema)
+                .provisionedThroughput(provisionedThroughput)
+                .attributeDefinitions(attrDefs).build())
+                .thenAccept(r -> { });
+    }
+
+    /**
+     * Releases all held locks and shuts down the internal scheduler.
+     * Returns a {@link CompletableFuture} that completes when all releases finish.
+     */
+    public CompletableFuture<Void> closeAsync() {
+        this.shuttingDown = true;
+        final List<CompletableFuture<?>> releases = new ArrayList<>(this.locks.values()).stream()
+                .map(this::releaseLockAsync)
+                .collect(Collectors.toList());
+        return CompletableFuture.allOf(releases.toArray(new CompletableFuture[0]))
+                .whenComplete((v, ex) -> {
+                    if (ownsScheduler) {
+                        scheduler.shutdown();
+                    }
+                    if (ex != null) {
+                        logger.warn("Exceptions occurred while releasing locks during close", ex);
+                    }
+                });
+    }
+
+    /** Blocking close for try-with-resources. Calls {@link #closeAsync()} and waits. */
+    @Override
+    public void close() {
+        closeAsync().join();
+    }
+
+    // -------------------------------------------------------------------------
+    // LockItemOwner — blocking wrappers so LockItem.close() works transparently
+    // -------------------------------------------------------------------------
+
+    @Override
+    public boolean releaseLock(final LockItem lockItem) {
+        return releaseLockAsync(lockItem).join();
+    }
+
+    @Override
+    public void sendHeartbeat(final LockItem lockItem) {
+        sendHeartbeatAsync(lockItem).join();
+    }
+
+    @Override
+    public void sendHeartbeat(final SendHeartbeatOptions options) {
+        sendHeartbeatAsync(options).join();
+    }
+
+    // -------------------------------------------------------------------------
+    // Private — heartbeat scheduler
+    // -------------------------------------------------------------------------
+
+    private void scheduleNextHeartbeatRound(final long delayMs) {
+        if (shuttingDown) {
+            return;
+        }
+        scheduler.schedule(this::executeHeartbeatRound, delayMs, TimeUnit.MILLISECONDS);
+    }
+
+    private void executeHeartbeatRound() {
+        if (shuttingDown) {
+            return;
+        }
+        final long start = LockClientUtils.INSTANCE.millisecondTime();
+        final List<CompletableFuture<Void>> heartbeats = new ArrayList<>(this.locks.values()).stream()
+                .map(lock -> sendHeartbeatAsync(lock)
+                        .exceptionally(ex -> {
+                            final Throwable cause = unwrap(ex);
+                            if (cause instanceof LockNotGrantedException) {
+                                logger.debug("Heartbeat failed for lock " + lock.getUniqueIdentifier(), cause);
+                            } else {
+                                logger.warn("Exception sending heartbeat for lock " + lock.getUniqueIdentifier(), cause);
+                            }
+                            return null;
+                        }))
+                .collect(Collectors.toList());
+
+        CompletableFuture.allOf(heartbeats.toArray(new CompletableFuture[0]))
+                .whenComplete((v, ex) -> {
+                    if (!shuttingDown) {
+                        final long elapsed = LockClientUtils.INSTANCE.millisecondTime() - start;
+                        scheduleNextHeartbeatRound(Math.max(heartbeatPeriodInMilliseconds - elapsed, 0L));
+                    }
+                });
+    }
+
+    // -------------------------------------------------------------------------
+    // Private — session monitor management
+    // -------------------------------------------------------------------------
+
+    private void tryAddSessionMonitor(final String lockName, final LockItem lock) {
+        if (lock.hasSessionMonitor() && lock.hasCallback()) {
+            scheduleSessionMonitor(lockName, lock);
+        }
+    }
+
+    private void scheduleSessionMonitor(final String lockName, final LockItem lock) {
+        final long delayMs = Math.max(lock.millisecondsUntilDangerZoneEntered(), 0L);
+        final ScheduledFuture<?> future = scheduler.schedule(() -> {
+            if (lock.millisecondsUntilDangerZoneEntered() <= 0) {
+                lock.runSessionMonitor();
+                sessionMonitors.remove(lockName);
+            } else {
+                // Heartbeat pushed back the expiry — reschedule
+                scheduleSessionMonitor(lockName, lock);
+            }
+        }, delayMs, TimeUnit.MILLISECONDS);
+        sessionMonitors.put(lockName, future);
+    }
+
+    private void removeKillSessionMonitor(final String monitorName) {
+        final ScheduledFuture<?> future = sessionMonitors.remove(monitorName);
+        if (future != null) {
+            future.cancel(true);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Private — acquire-lock upsert helpers
+    // -------------------------------------------------------------------------
+
+    private CompletableFuture<LockItem> upsertAndMonitorNewLockAsync(
+            AcquireLockOptions options, String key, Optional<String> sortKey,
+            boolean deleteLockOnRelease, Optional<SessionMonitor> sessionMonitor,
+            Optional<ByteBuffer> newLockData, Map<String, AttributeValue> item,
+            String recordVersionNumber) {
+
+        final Map<String, String> exprNames = new HashMap<>();
+        exprNames.put(PK_PATH_EXPRESSION_VARIABLE, this.partitionKeyName);
+        final String condExpr;
+        if (this.sortKeyName.isPresent()) {
+            condExpr = ACQUIRE_LOCK_THAT_DOESNT_EXIST_PK_SK_CONDITION;
+            exprNames.put(SK_PATH_EXPRESSION_VARIABLE, sortKeyName.get());
+        } else {
+            condExpr = ACQUIRE_LOCK_THAT_DOESNT_EXIST_PK_CONDITION;
+        }
+
+        if (options.getUpdateExistingLockRecord()) {
+            item.remove(partitionKeyName);
+            sortKeyName.ifPresent(item::remove);
+            final Map<String, AttributeValue> exprValues = new HashMap<>();
+            final String updateExpr = buildUpdateExpression(item, exprNames, exprValues);
+            return updateItemAndStartSessionMonitorAsync(options, key, sortKey, deleteLockOnRelease,
+                    sessionMonitor, newLockData, recordVersionNumber,
+                    UpdateItemRequest.builder().tableName(tableName).key(getKeys(key, sortKey))
+                            .updateExpression(updateExpr).expressionAttributeNames(exprNames)
+                            .expressionAttributeValues(exprValues).conditionExpression(condExpr).build());
+        } else {
+            return putLockItemAndStartSessionMonitorAsync(options, key, sortKey, deleteLockOnRelease,
+                    sessionMonitor, newLockData, recordVersionNumber,
+                    PutItemRequest.builder().item(item).tableName(tableName)
+                            .conditionExpression(condExpr).expressionAttributeNames(exprNames).build());
+        }
+    }
+
+    private CompletableFuture<LockItem> upsertAndMonitorReleasedLockAsync(
+            AcquireLockOptions options, String key, Optional<String> sortKey,
+            boolean deleteLockOnRelease, Optional<SessionMonitor> sessionMonitor,
+            Optional<LockItem> existingLock, Optional<ByteBuffer> newLockData,
+            Map<String, AttributeValue> item, String recordVersionNumber) {
+
+        final boolean consistentLockData = options.getAcquireReleasedLocksConsistently();
+        final Map<String, String> exprNames = new HashMap<>();
+        final Map<String, AttributeValue> exprValues = new HashMap<>();
+        if (consistentLockData) {
+            exprValues.put(RVN_VALUE_EXPRESSION_VARIABLE,
+                    AttributeValue.builder().s(existingLock.get().getRecordVersionNumber()).build());
+            exprNames.put(RVN_PATH_EXPRESSION_VARIABLE, RECORD_VERSION_NUMBER);
+        }
+        exprNames.put(PK_PATH_EXPRESSION_VARIABLE, partitionKeyName);
+        exprNames.put(IS_RELEASED_PATH_EXPRESSION_VARIABLE, IS_RELEASED);
+        exprValues.put(IS_RELEASED_VALUE_EXPRESSION_VARIABLE, IS_RELEASED_ATTRIBUTE_VALUE);
+
+        final String condExpr;
+        if (this.sortKeyName.isPresent()) {
+            exprNames.put(SK_PATH_EXPRESSION_VARIABLE, sortKeyName.get());
+            condExpr = consistentLockData
+                    ? PK_EXISTS_AND_SK_EXISTS_AND_RVN_IS_THE_SAME_AND_IS_RELEASED_CONDITION
+                    : PK_EXISTS_AND_SK_EXISTS_AND_IS_RELEASED_CONDITION;
+        } else {
+            condExpr = consistentLockData
+                    ? PK_EXISTS_AND_RVN_IS_THE_SAME_AND_IS_RELEASED_CONDITION
+                    : PK_EXISTS_AND_IS_RELEASED_CONDITION;
+        }
+
+        if (options.getUpdateExistingLockRecord()) {
+            item.remove(partitionKeyName);
+            sortKeyName.ifPresent(item::remove);
+            final String updateExpr = buildUpdateExpression(item, exprNames, exprValues)
+                    + REMOVE_IS_RELEASED_UPDATE_EXPRESSION;
+            return updateItemAndStartSessionMonitorAsync(options, key, sortKey, deleteLockOnRelease,
+                    sessionMonitor, newLockData, recordVersionNumber,
+                    UpdateItemRequest.builder().tableName(tableName).key(getItemKeys(existingLock.get()))
+                            .updateExpression(updateExpr).expressionAttributeNames(exprNames)
+                            .expressionAttributeValues(exprValues).conditionExpression(condExpr).build());
+        } else {
+            return putLockItemAndStartSessionMonitorAsync(options, key, sortKey, deleteLockOnRelease,
+                    sessionMonitor, newLockData, recordVersionNumber,
+                    PutItemRequest.builder().item(item).tableName(tableName)
+                            .conditionExpression(condExpr).expressionAttributeNames(exprNames)
+                            .expressionAttributeValues(exprValues).build());
+        }
+    }
+
+    private CompletableFuture<LockItem> upsertAndMonitorExpiredLockAsync(
+            AcquireLockOptions options, String key, Optional<String> sortKey,
+            boolean deleteLockOnRelease, Optional<SessionMonitor> sessionMonitor,
+            Optional<LockItem> existingLock, Optional<ByteBuffer> newLockData,
+            Map<String, AttributeValue> item, String recordVersionNumber) {
+
+        final Map<String, AttributeValue> exprValues = new HashMap<>();
+        exprValues.put(RVN_VALUE_EXPRESSION_VARIABLE,
+                AttributeValue.builder().s(existingLock.get().getRecordVersionNumber()).build());
+        final Map<String, String> exprNames = new HashMap<>();
+        exprNames.put(PK_PATH_EXPRESSION_VARIABLE, partitionKeyName);
+        exprNames.put(RVN_PATH_EXPRESSION_VARIABLE, RECORD_VERSION_NUMBER);
+        final String condExpr;
+        if (this.sortKeyName.isPresent()) {
+            condExpr = PK_EXISTS_AND_SK_EXISTS_AND_RVN_IS_THE_SAME_CONDITION;
+            exprNames.put(SK_PATH_EXPRESSION_VARIABLE, sortKeyName.get());
+        } else {
+            condExpr = PK_EXISTS_AND_RVN_IS_THE_SAME_CONDITION;
+        }
+
+        if (options.getUpdateExistingLockRecord()) {
+            item.remove(partitionKeyName);
+            sortKeyName.ifPresent(item::remove);
+            final String updateExpr = buildUpdateExpression(item, exprNames, exprValues);
+            return updateItemAndStartSessionMonitorAsync(options, key, sortKey, deleteLockOnRelease,
+                    sessionMonitor, newLockData, recordVersionNumber,
+                    UpdateItemRequest.builder().tableName(tableName).key(getItemKeys(existingLock.get()))
+                            .updateExpression(updateExpr).expressionAttributeNames(exprNames)
+                            .expressionAttributeValues(exprValues).conditionExpression(condExpr).build());
+        } else {
+            return putLockItemAndStartSessionMonitorAsync(options, key, sortKey, deleteLockOnRelease,
+                    sessionMonitor, newLockData, recordVersionNumber,
+                    PutItemRequest.builder().item(item).tableName(tableName)
+                            .conditionExpression(condExpr).expressionAttributeNames(exprNames)
+                            .expressionAttributeValues(exprValues).build());
+        }
+    }
+
+    private CompletableFuture<LockItem> putLockItemAndStartSessionMonitorAsync(
+            AcquireLockOptions options, String key, Optional<String> sortKey,
+            boolean deleteLockOnRelease, Optional<SessionMonitor> sessionMonitor,
+            Optional<ByteBuffer> newLockData, String recordVersionNumber,
+            PutItemRequest request) {
+        // Capture time BEFORE the DDB call — errs on the side of expiring sooner.
+        final long lastUpdated = LockClientUtils.INSTANCE.millisecondTime();
+        return this.dynamoDB.putItem(request).thenApply(resp -> {
+            final LockItem lockItem = new LockItem(this, key, sortKey, newLockData,
+                    deleteLockOnRelease, this.ownerName, this.leaseDurationInMilliseconds,
+                    lastUpdated, recordVersionNumber, false, sessionMonitor,
+                    options.getAdditionalAttributes());
+            this.locks.put(lockItem.getUniqueIdentifier(), lockItem);
+            tryAddSessionMonitor(lockItem.getUniqueIdentifier(), lockItem);
+            return lockItem;
+        });
+    }
+
+    private CompletableFuture<LockItem> updateItemAndStartSessionMonitorAsync(
+            AcquireLockOptions options, String key, Optional<String> sortKey,
+            boolean deleteLockOnRelease, Optional<SessionMonitor> sessionMonitor,
+            Optional<ByteBuffer> newLockData, String recordVersionNumber,
+            UpdateItemRequest request) {
+        final long lastUpdated = LockClientUtils.INSTANCE.millisecondTime();
+        return this.dynamoDB.updateItem(request).thenApply(resp -> {
+            final LockItem lockItem = new LockItem(this, key, sortKey, newLockData,
+                    deleteLockOnRelease, this.ownerName, this.leaseDurationInMilliseconds,
+                    lastUpdated, recordVersionNumber, false, sessionMonitor,
+                    options.getAdditionalAttributes());
+            this.locks.put(lockItem.getUniqueIdentifier(), lockItem);
+            tryAddSessionMonitor(lockItem.getUniqueIdentifier(), lockItem);
+            return lockItem;
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Private — misc helpers
+    // -------------------------------------------------------------------------
+
+    private LockItem createLockItem(final GetLockOptions options, final Map<String, AttributeValue> immutableItem) {
+        final Map<String, AttributeValue> item = new HashMap<>(immutableItem);
+        final Optional<ByteBuffer> data = Optional.ofNullable(item.remove(DATA))
+                .map(av -> av.b().asByteBuffer());
+        final AttributeValue ownerNameAv = item.remove(OWNER_NAME);
+        final AttributeValue leaseDurationAv = item.remove(LEASE_DURATION);
+        final AttributeValue rvnAv = item.remove(RECORD_VERSION_NUMBER);
+        final boolean isReleased = item.containsKey(IS_RELEASED);
+        item.remove(IS_RELEASED);
+        item.remove(this.partitionKeyName);
+        final long lookupTime = LockClientUtils.INSTANCE.millisecondTime();
+        return new LockItem(this, options.getPartitionKey(), options.getSortKey(), data,
+                options.isDeleteLockOnRelease(), ownerNameAv.s(),
+                Long.parseLong(leaseDurationAv.s()), lookupTime, rvnAv.s(),
+                isReleased, Optional.empty(), item);
+    }
+
+    private LockItem buildLockItemFromScanResult(
+            final String key, final boolean deleteOnRelease, final Map<String, AttributeValue> item) {
+        GetLockOptions.GetLockOptionsBuilder builder =
+                GetLockOptions.builder(key).withDeleteLockOnRelease(deleteOnRelease);
+        builder = this.sortKeyName.map(item::get).map(AttributeValue::s)
+                .map(builder::withSortKey).orElse(builder);
+        return createLockItem(builder.build(), item);
+    }
+
+    private Map<String, AttributeValue> getItemKeys(final LockItem lockItem) {
+        return getKeys(lockItem.getPartitionKey(), lockItem.getSortKey());
+    }
+
+    private Map<String, AttributeValue> getKeys(final String partitionKey, final Optional<String> sortKey) {
+        final Map<String, AttributeValue> key = new HashMap<>();
+        key.put(this.partitionKeyName, AttributeValue.builder().s(partitionKey).build());
+        if (sortKey.isPresent()) {
+            key.put(this.sortKeyName.get(), AttributeValue.builder().s(sortKey.get()).build());
+        }
+        return key;
+    }
+
+    private String buildUpdateExpression(
+            final Map<String, AttributeValue> item,
+            final Map<String, String> exprNames,
+            final Map<String, AttributeValue> exprValues) {
+        final StringBuilder sb = new StringBuilder("SET ");
+        final Iterator<Map.Entry<String, AttributeValue>> it = item.entrySet().iterator();
+        int i = 0;
+        while (it.hasNext()) {
+            final Map.Entry<String, AttributeValue> entry = it.next();
+            exprNames.put("#k" + i, entry.getKey());
+            exprValues.put(":v" + i, entry.getValue());
+            sb.append("#k").append(i).append("=").append(":v").append(i);
+            if (it.hasNext()) {
+                sb.append(",");
+            }
+            i++;
+        }
+        return sb.toString();
+    }
+
+    private String generateRecordVersionNumber() {
+        return UUID.randomUUID().toString();
+    }
+
+    private static void sessionMonitorArgsValidate(
+            final long safeTimeMs, final long heartbeatPeriodMs, final long leaseDurationMs) {
+        if (safeTimeMs <= heartbeatPeriodMs) {
+            throw new IllegalArgumentException("safeTimeWithoutHeartbeat must be greater than heartbeat frequency");
+        }
+        if (safeTimeMs >= leaseDurationMs) {
+            throw new IllegalArgumentException("safeTimeWithoutHeartbeat must be less than the lock's lease duration");
+        }
+    }
+
+    private static Throwable unwrap(final Throwable t) {
+        if (t instanceof java.util.concurrent.CompletionException && t.getCause() != null) {
+            return t.getCause();
+        }
+        return t;
+    }
+
+    private static <T> CompletableFuture<T> failedFuture(final Throwable t) {
+        final CompletableFuture<T> f = new CompletableFuture<>();
+        f.completeExceptionally(t);
+        return f;
+    }
+}
