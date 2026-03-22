@@ -293,7 +293,7 @@ public class LockItem implements Closeable {
      * client.
      */
     void updateRecordVersionNumber(final String recordVersionNumber, final long lastUpdateOfLock, final long leaseDurationToEnsureInMilliseconds) {
-        this.recordVersionNumber.replace(0, recordVersionNumber.length(), recordVersionNumber);
+        this.recordVersionNumber.replace(0, this.recordVersionNumber.length(), recordVersionNumber);
         this.lookupTime.set(lastUpdateOfLock);
         this.leaseDuration.set(leaseDurationToEnsureInMilliseconds);
     }
