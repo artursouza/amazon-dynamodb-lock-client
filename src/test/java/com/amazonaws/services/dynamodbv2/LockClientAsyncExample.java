@@ -68,20 +68,18 @@ public class LockClientAsyncExample {
                         .withCreateHeartbeatBackgroundThread(true)
                         .build())) {
 
-            // 4a. Blocking style — call .get() to wait for the result.
-            //     Useful when the surrounding code is already synchronous.
-            final Optional<LockItem> lockItem =
-                    client.tryAcquireLockAsync(AcquireLockOptions.builder("Moe").build()).get();
-            if (lockItem.isPresent()) {
-                System.out.println("Acquired lock! If I die, my lock will expire in 10 seconds.");
-                System.out.println("Otherwise, I will hold it until I stop heartbeating.");
-                client.releaseLockAsync(lockItem.get()).get();
-            } else {
-                System.out.println("Failed to acquire lock for Moe.");
-            }
+            // 4a. withLockAsync — acquires the lock, runs the work, releases on completion.
+            //     The lock is always released, even if the work throws.
+            client.withLockAsync(
+                    AcquireLockOptions.builder("Moe").build(),
+                    lock -> {
+                        System.out.println("Acquired lock! If I die, my lock will expire in 10 seconds.");
+                        System.out.println("Otherwise, I will hold it until I stop heartbeating.");
+                        return CompletableFuture.completedFuture(null);
+                    }).join();
 
-            // 4b. Non-blocking chain style — compose futures so no thread is ever
-            //     blocked waiting on network I/O.
+            // 4b. tryAcquireLockAsync — returns Optional so you can handle the
+            //     "lock unavailable" case without catching an exception.
             final CompletableFuture<Void> pipeline =
                     client.tryAcquireLockAsync(AcquireLockOptions.builder("Larry").build())
                             .thenCompose(maybeLock -> {
@@ -89,15 +87,14 @@ public class LockClientAsyncExample {
                                     System.out.println("Lock for Larry is unavailable.");
                                     return CompletableFuture.completedFuture(null);
                                 }
-                                final LockItem lock = maybeLock.get();
                                 System.out.println("Lock for Larry acquired — doing protected work.");
-                                // ... perform protected work here (async or sync) ...
-                                return client.releaseLockAsync(lock)
+                                // ... perform protected work here ...
+                                return client.releaseLockAsync(maybeLock.get())
                                         .thenAccept(released ->
                                                 System.out.println("Lock for Larry released: " + released));
                             });
 
-            pipeline.join(); // wait for the pipeline before try-with-resources closes the client
+            pipeline.join();
         }
     }
 

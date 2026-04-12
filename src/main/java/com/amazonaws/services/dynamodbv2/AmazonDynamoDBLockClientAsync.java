@@ -80,7 +80,7 @@ import java.util.stream.Collectors;
  * <p>This class is thread-safe.
  */
 @ThreadSafe
-public class AmazonDynamoDBLockClientAsync implements Closeable, LockItemOwner {
+public class AmazonDynamoDBLockClientAsync implements Closeable {
 
     private static final Log logger = LogFactory.getLog(AmazonDynamoDBLockClientAsync.class);
 
@@ -870,23 +870,69 @@ public class AmazonDynamoDBLockClientAsync implements Closeable, LockItemOwner {
         closeAsync().join();
     }
 
-    // -------------------------------------------------------------------------
-    // LockItemOwner — blocking wrappers so LockItem.close() works transparently
-    // -------------------------------------------------------------------------
-
-    @Override
-    public boolean releaseLock(final LockItem lockItem) {
-        return releaseLockAsync(lockItem).join();
+    /**
+     * Acquires a lock, executes {@code work}, then releases the lock — the async
+     * equivalent of try-with-resources. The lock is released in a
+     * {@code whenComplete} handler so it is always released regardless of whether
+     * {@code work} succeeds or fails.
+     *
+     * <pre>{@code
+     * client.withLockAsync(
+     *     AcquireLockOptions.builder("key").build(),
+     *     lock -> doProtectedWorkAsync()
+     * );
+     * }</pre>
+     */
+    public <T> CompletableFuture<T> withLockAsync(
+            final AcquireLockOptions options,
+            final java.util.function.Function<LockItem, CompletableFuture<T>> work) {
+        return acquireLockAsync(options)
+                .thenCompose(lock ->
+                        work.apply(lock)
+                                .whenComplete((result, ex) -> releaseLockAsync(lock)));
     }
 
-    @Override
-    public void sendHeartbeat(final LockItem lockItem) {
-        sendHeartbeatAsync(lockItem).join();
+    // -------------------------------------------------------------------------
+    // Private — LockItemOwner bridge (used only by LockItem.close())
+    // -------------------------------------------------------------------------
+
+    /**
+     * Returns a {@link LockItemOwner} whose blocking methods delegate to this
+     * client's async equivalents. This is passed to {@link LockItem} at
+     * construction time so that {@code lockItem.close()} works correctly without
+     * exposing any blocking methods on the public API of this class.
+     */
+    private LockItemOwner asLockItemOwner() {
+        return new LockItemOwnerBridge(this);
     }
 
-    @Override
-    public void sendHeartbeat(final SendHeartbeatOptions options) {
-        sendHeartbeatAsync(options).join();
+    /**
+     * Static bridge that implements {@link LockItemOwner} by delegating to the
+     * async client's {@code CompletableFuture}-returning methods via {@code join()}.
+     * Using a static named class avoids holding an implicit reference to the outer
+     * instance (SpotBugs SIC_INNER_SHOULD_BE_STATIC_ANON).
+     */
+    private static final class LockItemOwnerBridge implements LockItemOwner {
+        private final AmazonDynamoDBLockClientAsync client;
+
+        LockItemOwnerBridge(final AmazonDynamoDBLockClientAsync client) {
+            this.client = client;
+        }
+
+        @Override
+        public boolean releaseLock(final LockItem lockItem) {
+            return this.client.releaseLockAsync(lockItem).join();
+        }
+
+        @Override
+        public void sendHeartbeat(final LockItem lockItem) {
+            this.client.sendHeartbeatAsync(lockItem).join();
+        }
+
+        @Override
+        public void sendHeartbeat(final SendHeartbeatOptions options) {
+            this.client.sendHeartbeatAsync(options).join();
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1093,8 +1139,9 @@ public class AmazonDynamoDBLockClientAsync implements Closeable, LockItemOwner {
             PutItemRequest request) {
         // Capture time BEFORE the DDB call — errs on the side of expiring sooner.
         final long lastUpdated = LockClientUtils.INSTANCE.millisecondTime();
+        final LockItemOwner owner = asLockItemOwner();
         return this.dynamoDB.putItem(request).thenApply(resp -> {
-            final LockItem lockItem = new LockItem(this, key, sortKey, newLockData,
+            final LockItem lockItem = new LockItem(owner, key, sortKey, newLockData,
                     deleteLockOnRelease, this.ownerName, this.leaseDurationInMilliseconds,
                     lastUpdated, recordVersionNumber, false, sessionMonitor,
                     options.getAdditionalAttributes());
@@ -1110,8 +1157,9 @@ public class AmazonDynamoDBLockClientAsync implements Closeable, LockItemOwner {
             Optional<ByteBuffer> newLockData, String recordVersionNumber,
             UpdateItemRequest request) {
         final long lastUpdated = LockClientUtils.INSTANCE.millisecondTime();
+        final LockItemOwner owner = asLockItemOwner();
         return this.dynamoDB.updateItem(request).thenApply(resp -> {
-            final LockItem lockItem = new LockItem(this, key, sortKey, newLockData,
+            final LockItem lockItem = new LockItem(owner, key, sortKey, newLockData,
                     deleteLockOnRelease, this.ownerName, this.leaseDurationInMilliseconds,
                     lastUpdated, recordVersionNumber, false, sessionMonitor,
                     options.getAdditionalAttributes());
@@ -1136,7 +1184,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable, LockItemOwner {
         item.remove(IS_RELEASED);
         item.remove(this.partitionKeyName);
         final long lookupTime = LockClientUtils.INSTANCE.millisecondTime();
-        return new LockItem(this, options.getPartitionKey(), options.getSortKey(), data,
+        return new LockItem(asLockItemOwner(), options.getPartitionKey(), options.getSortKey(), data,
                 options.isDeleteLockOnRelease(), ownerNameAv.s(),
                 Long.parseLong(leaseDurationAv.s()), lookupTime, rvnAv.s(),
                 isReleased, Optional.empty(), item);
