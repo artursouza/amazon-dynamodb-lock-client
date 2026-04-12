@@ -24,6 +24,7 @@ import java.util.HashMap;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
+import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
@@ -47,7 +48,13 @@ public class LockItemTest {
         createLockItem(lockClient).hashCode();
     }
 
-    LockItem mockableLockItem = Mockito.spy(createLockItem(lockClient));
+    LockItem mockableLockItem;
+
+    @Before
+    public void setUp() {
+        mockableLockItem = Mockito.spy(createLockItem(lockClient));
+    }
+
     @Test
     public void equals_rightNull_returnFalse() {
         assertFalse(createLockItem(lockClient).equals(null));

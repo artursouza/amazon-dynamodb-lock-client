@@ -247,7 +247,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
         when(dynamoDB.putItem(any(PutItemRequest.class)))
                 .thenReturn(CompletableFuture.completedFuture(PutItemResponse.builder().build()));
 
-        LockItem lock = client.acquireLockAsync(AcquireLockOptions.builder("customer1").build())
+        LockItemAsync lock = client.acquireLockAsync(AcquireLockOptions.builder("customer1").build())
                 .get(5, TimeUnit.SECONDS);
 
         assertNotNull(lock);
@@ -264,7 +264,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
         when(dynamoDB.putItem(any(PutItemRequest.class)))
                 .thenReturn(CompletableFuture.completedFuture(PutItemResponse.builder().build()));
 
-        LockItem lock = client.acquireLockAsync(AcquireLockOptions.builder("customer1").build())
+        LockItemAsync lock = client.acquireLockAsync(AcquireLockOptions.builder("customer1").build())
                 .get(5, TimeUnit.SECONDS);
 
         assertNotNull(lock);
@@ -348,7 +348,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
     // =========================================================================
 
     /** Acquires a lock using the mock DDB client (putItem path). */
-    private LockItem acquireLock(String partitionKey) throws Exception {
+    private LockItemAsync acquireLock(String partitionKey) throws Exception {
         when(dynamoDB.getItem(any(GetItemRequest.class)))
                 .thenReturn(CompletableFuture.completedFuture(GetItemResponse.builder().build()));
         when(dynamoDB.putItem(any(PutItemRequest.class)))
@@ -360,7 +360,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
 
     @Test
     public void releaseLockAsync_deletePath_callsDeleteItemAndReturnsTrue() throws Exception {
-        LockItem lock = acquireLock("customer1");
+        LockItemAsync lock = acquireLock("customer1");
         when(dynamoDB.deleteItem(any(DeleteItemRequest.class)))
                 .thenReturn(CompletableFuture.completedFuture(DeleteItemResponse.builder().build()));
 
@@ -376,7 +376,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
                 .thenReturn(CompletableFuture.completedFuture(GetItemResponse.builder().build()));
         when(dynamoDB.putItem(any(PutItemRequest.class)))
                 .thenReturn(CompletableFuture.completedFuture(PutItemResponse.builder().build()));
-        LockItem lock = client.acquireLockAsync(
+        LockItemAsync lock = client.acquireLockAsync(
                 AcquireLockOptions.builder("customer1").withDeleteLockOnRelease(false).build())
                 .get(5, TimeUnit.SECONDS);
         when(dynamoDB.updateItem(any(UpdateItemRequest.class)))
@@ -390,7 +390,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
 
     @Test
     public void releaseLockAsync_conditionalCheckFailed_returnsFalse() throws Exception {
-        LockItem lock = acquireLock("customer1");
+        LockItemAsync lock = acquireLock("customer1");
         when(dynamoDB.deleteItem(any(DeleteItemRequest.class)))
                 .thenReturn(failedFuture(ConditionalCheckFailedException.builder().message("conflict").build()));
 
@@ -400,22 +400,18 @@ public class AmazonDynamoDBLockClientAsyncTest {
     }
 
     @Test
-    public void releaseLockAsync_bestEffortSdkClientException_returnsTrue() throws Exception {
+    public void releaseLockAsync_sdkClientException_propagatesException() throws Exception {
         when(dynamoDB.getItem(any(GetItemRequest.class)))
                 .thenReturn(CompletableFuture.completedFuture(GetItemResponse.builder().build()));
         when(dynamoDB.putItem(any(PutItemRequest.class)))
                 .thenReturn(CompletableFuture.completedFuture(PutItemResponse.builder().build()));
-        LockItem lock = client.acquireLockAsync(
+        LockItemAsync lock = client.acquireLockAsync(
                 AcquireLockOptions.builder("customer1").withDeleteLockOnRelease(true).build())
                 .get(5, TimeUnit.SECONDS);
         when(dynamoDB.deleteItem(any(DeleteItemRequest.class)))
                 .thenReturn(failedFuture(SdkClientException.builder().message("network error").build()));
 
-        boolean released = client.releaseLockAsync(
-                ReleaseLockOptions.builder(lock).withDeleteLock(true).withBestEffort(true).build())
-                .get(5, TimeUnit.SECONDS);
-
-        assertTrue(released);
+        assertFutureThrows(SdkClientException.class, client.releaseLockAsync(lock));
     }
 
     // =========================================================================
@@ -424,7 +420,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
 
     @Test
     public void sendHeartbeatAsync_success_updatesRecordVersionNumber() throws Exception {
-        LockItem lock = acquireLock("customer1");
+        LockItemAsync lock = acquireLock("customer1");
         String originalRvn = lock.getRecordVersionNumber();
 
         when(dynamoDB.updateItem(any(UpdateItemRequest.class)))
@@ -452,7 +448,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
             when(dynamoDB.putItem(any(PutItemRequest.class)))
                     .thenReturn(CompletableFuture.completedFuture(PutItemResponse.builder().build()));
 
-            LockItem lock = tinyLeaseClient.acquireLockAsync(
+            LockItemAsync lock = tinyLeaseClient.acquireLockAsync(
                     AcquireLockOptions.builder("customer1").build()).get(5, TimeUnit.SECONDS);
 
             Thread.sleep(50); // wait past the 1 ms lease
@@ -465,7 +461,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
 
     @Test
     public void sendHeartbeatAsync_conditionalCheckFailed_removesLockAndThrows() throws Exception {
-        LockItem lock = acquireLock("customer1");
+        LockItemAsync lock = acquireLock("customer1");
         when(dynamoDB.updateItem(any(UpdateItemRequest.class)))
                 .thenReturn(failedFuture(ConditionalCheckFailedException.builder().message("conflict").build()));
 
@@ -479,7 +475,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
                 .thenReturn(CompletableFuture.completedFuture(GetItemResponse.builder().build()));
         when(dynamoDB.putItem(any(PutItemRequest.class)))
                 .thenReturn(CompletableFuture.completedFuture(PutItemResponse.builder().build()));
-        LockItem lock = clientWithHoldLock.acquireLockAsync(
+        LockItemAsync lock = clientWithHoldLock.acquireLockAsync(
                 AcquireLockOptions.builder("customer1").build()).get(5, TimeUnit.SECONDS);
 
         AwsServiceException serviceUnavailable = (AwsServiceException) AwsServiceException.builder()
@@ -497,7 +493,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
 
     @Test
     public void sendHeartbeatAsync_serviceUnavailableWithoutHoldLock_propagatesException() throws Exception {
-        LockItem lock = acquireLock("customer1");
+        LockItemAsync lock = acquireLock("customer1");
 
         AwsServiceException serviceUnavailable = (AwsServiceException) AwsServiceException.builder()
                 .awsErrorDetails(AwsErrorDetails.builder()
@@ -518,9 +514,9 @@ public class AmazonDynamoDBLockClientAsyncTest {
 
     @Test
     public void getLockAsync_lockHeldLocally_returnsFromCache() throws Exception {
-        LockItem lock = acquireLock("customer1");
+        LockItemAsync lock = acquireLock("customer1");
 
-        Optional<LockItem> result = client.getLockAsync("customer1", Optional.empty()).get(5, TimeUnit.SECONDS);
+        Optional<LockItemAsync> result = client.getLockAsync("customer1", Optional.empty()).get(5, TimeUnit.SECONDS);
 
         assertTrue(result.isPresent());
         // Should return the same object from local cache (no extra getItem call)
@@ -533,7 +529,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
                 .thenReturn(CompletableFuture.completedFuture(
                         GetItemResponse.builder().item(thirdPartyLockItem("rvn1", LEASE_MS)).build()));
 
-        Optional<LockItem> result = client.getLockAsync("customer1", Optional.empty()).get(5, TimeUnit.SECONDS);
+        Optional<LockItemAsync> result = client.getLockAsync("customer1", Optional.empty()).get(5, TimeUnit.SECONDS);
 
         assertTrue(result.isPresent());
         verify(dynamoDB).getItem(any(GetItemRequest.class));
@@ -545,7 +541,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
                 .thenReturn(CompletableFuture.completedFuture(
                         GetItemResponse.builder().item(releasedLockItem()).build()));
 
-        Optional<LockItem> result = client.getLockAsync("customer1", Optional.empty()).get(5, TimeUnit.SECONDS);
+        Optional<LockItemAsync> result = client.getLockAsync("customer1", Optional.empty()).get(5, TimeUnit.SECONDS);
 
         assertFalse(result.isPresent());
     }
@@ -555,7 +551,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
         when(dynamoDB.getItem(any(GetItemRequest.class)))
                 .thenReturn(CompletableFuture.completedFuture(GetItemResponse.builder().build()));
 
-        Optional<LockItem> result = client.getLockAsync("customer1", Optional.empty()).get(5, TimeUnit.SECONDS);
+        Optional<LockItemAsync> result = client.getLockAsync("customer1", Optional.empty()).get(5, TimeUnit.SECONDS);
 
         assertFalse(result.isPresent());
     }
@@ -566,7 +562,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
                 .thenReturn(CompletableFuture.completedFuture(
                         GetItemResponse.builder().item(thirdPartyLockItem("rvn1", LEASE_MS)).build()));
 
-        Optional<LockItem> result = client.getLockAsync("customer1", Optional.empty()).get(5, TimeUnit.SECONDS);
+        Optional<LockItemAsync> result = client.getLockAsync("customer1", Optional.empty()).get(5, TimeUnit.SECONDS);
 
         assertTrue(result.isPresent());
         assertEquals("", result.get().getRecordVersionNumber());
@@ -580,7 +576,7 @@ public class AmazonDynamoDBLockClientAsyncTest {
 
         GetLockOptions opts = new GetLockOptions.GetLockOptionsBuilder("customer1")
                 .withDeleteLockOnRelease(false).build();
-        Optional<LockItem> result = client.getLockFromDynamoDBAsync(opts).get(5, TimeUnit.SECONDS);
+        Optional<LockItemAsync> result = client.getLockFromDynamoDBAsync(opts).get(5, TimeUnit.SECONDS);
 
         assertTrue(result.isPresent());
         assertEquals("other-owner", result.get().getOwnerName());

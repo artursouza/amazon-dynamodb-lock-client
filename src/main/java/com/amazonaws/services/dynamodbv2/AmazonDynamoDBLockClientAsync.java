@@ -101,8 +101,6 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
     private static final String RVN_VALUE_EXPRESSION_VARIABLE = ":rvn";
     private static final String OWNER_NAME_PATH_EXPRESSION_VARIABLE = "#on";
     private static final String OWNER_NAME_VALUE_EXPRESSION_VARIABLE = ":on";
-    private static final String DATA_PATH_EXPRESSION_VARIABLE = "#d";
-    private static final String DATA_VALUE_EXPRESSION_VARIABLE = ":d";
     private static final String IS_RELEASED_PATH_EXPRESSION_VARIABLE = "#ir";
     private static final String IS_RELEASED_VALUE_EXPRESSION_VARIABLE = ":ir";
 
@@ -146,16 +144,10 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
 
     private static final String UPDATE_IS_RELEASED =
             String.format("SET %s = %s", IS_RELEASED_PATH_EXPRESSION_VARIABLE, IS_RELEASED_VALUE_EXPRESSION_VARIABLE);
-    private static final String UPDATE_IS_RELEASED_AND_DATA =
-            String.format("%s, %s = %s", UPDATE_IS_RELEASED, DATA_PATH_EXPRESSION_VARIABLE, DATA_VALUE_EXPRESSION_VARIABLE);
     private static final String UPDATE_LEASE_DURATION_AND_RVN =
             String.format("SET %s = %s, %s = %s",
                     LEASE_DURATION_PATH_VALUE_EXPRESSION_VARIABLE, LEASE_DURATION_VALUE_EXPRESSION_VARIABLE,
                     RVN_PATH_EXPRESSION_VARIABLE, NEW_RVN_VALUE_EXPRESSION_VARIABLE);
-    private static final String UPDATE_LEASE_DURATION_AND_RVN_AND_REMOVE_DATA =
-            String.format("%s REMOVE %s", UPDATE_LEASE_DURATION_AND_RVN, DATA_PATH_EXPRESSION_VARIABLE);
-    private static final String UPDATE_LEASE_DURATION_AND_RVN_AND_DATA =
-            String.format("%s, %s = %s", UPDATE_LEASE_DURATION_AND_RVN, DATA_PATH_EXPRESSION_VARIABLE, DATA_VALUE_EXPRESSION_VARIABLE);
     private static final String REMOVE_IS_RELEASED_UPDATE_EXPRESSION =
             String.format(" REMOVE %s ", IS_RELEASED_PATH_EXPRESSION_VARIABLE);
     private static final String QUERY_PK_EXPRESSION =
@@ -191,8 +183,8 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
     private final boolean holdLockOnServiceUnavailable;
     private final String ownerName;
 
-    private final ConcurrentHashMap<String, LockItem> locks = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, LockItem> notMyLocks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, LockItemAsync> locks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, LockItemAsync> notMyLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ScheduledFuture<?>> sessionMonitors = new ConcurrentHashMap<>();
 
     private final ScheduledExecutorService scheduler;
@@ -251,7 +243,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
      * or {@code additionalTimeToWaitForLock} elapses. No thread is blocked during
      * the wait; retries are scheduled on the internal {@link ScheduledExecutorService}.
      */
-    public CompletableFuture<LockItem> acquireLockAsync(final AcquireLockOptions options) {
+    public CompletableFuture<LockItemAsync> acquireLockAsync(final AcquireLockOptions options) {
         Objects.requireNonNull(options, "Cannot acquire lock when options is null");
         Objects.requireNonNull(options.getPartitionKey(), "Cannot acquire lock when key is null");
 
@@ -259,7 +251,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
         final Optional<String> sortKey = options.getSortKey();
 
         if (options.getReentrant() && hasLock(key, sortKey)) {
-            final LockItem local = this.locks.get(key + sortKey.orElse(""));
+            final LockItemAsync local = this.locks.get(key + sortKey.orElse(""));
             if (local != null && !local.isExpired()) {
                 return CompletableFuture.completedFuture(local);
             }
@@ -295,7 +287,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
         final boolean deleteLockOnRelease = options.getDeleteLockOnRelease();
         final long startTimeMs = LockClientUtils.INSTANCE.millisecondTime();
         final AtomicLong mutableMsToWait = new AtomicLong(millisecondsToWait);
-        final AtomicReference<LockItem> lockTryingToBeAcquired = new AtomicReference<>(null);
+        final AtomicReference<LockItemAsync> lockTryingToBeAcquired = new AtomicReference<>(null);
         final AtomicBoolean alreadySleptOnce = new AtomicBoolean(false);
         final GetLockOptions getLockOptions = new GetLockOptions.GetLockOptionsBuilder(key)
                 .withSortKey(sortKey.orElse(null))
@@ -303,7 +295,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
                 .build();
         final long finalRefreshPeriodMs = refreshPeriodMs;
 
-        final CompletableFuture<LockItem> promise = new CompletableFuture<>();
+        final CompletableFuture<LockItemAsync> promise = new CompletableFuture<>();
         runAcquireIteration(promise, options, key, sortKey, startTimeMs, mutableMsToWait,
                 finalRefreshPeriodMs, lockTryingToBeAcquired, alreadySleptOnce,
                 getLockOptions, deleteLockOnRelease, sessionMonitor);
@@ -311,10 +303,10 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
     }
 
     private void runAcquireIteration(
-            CompletableFuture<LockItem> promise, AcquireLockOptions options,
+            CompletableFuture<LockItemAsync> promise, AcquireLockOptions options,
             String key, Optional<String> sortKey,
             long startTimeMs, AtomicLong mutableMsToWait, long refreshPeriodMs,
-            AtomicReference<LockItem> lockTryingToBeAcquired, AtomicBoolean alreadySleptOnce,
+            AtomicReference<LockItemAsync> lockTryingToBeAcquired, AtomicBoolean alreadySleptOnce,
             GetLockOptions getLockOptions, boolean deleteLockOnRelease,
             Optional<SessionMonitor> sessionMonitor) {
 
@@ -380,10 +372,10 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
                 });
     }
 
-    private CompletableFuture<LockItem> handleAcquireWithExistingLock(
-            Optional<LockItem> existingLock, AcquireLockOptions options,
+    private CompletableFuture<LockItemAsync> handleAcquireWithExistingLock(
+            Optional<LockItemAsync> existingLock, AcquireLockOptions options,
             String key, Optional<String> sortKey,
-            AtomicLong mutableMsToWait, AtomicReference<LockItem> lockTryingToBeAcquired,
+            AtomicLong mutableMsToWait, AtomicReference<LockItemAsync> lockTryingToBeAcquired,
             AtomicBoolean alreadySleptOnce, boolean deleteLockOnRelease,
             Optional<SessionMonitor> sessionMonitor) {
 
@@ -438,7 +430,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
                     sessionMonitor, existingLock, finalNewLockData, item, recordVersionNumber);
         }
 
-        final LockItem ltba = lockTryingToBeAcquired.get();
+        final LockItemAsync ltba = lockTryingToBeAcquired.get();
         if (ltba == null) {
             lockTryingToBeAcquired.set(existingLock.get());
             if (!alreadySleptOnce.getAndSet(true)) {
@@ -462,7 +454,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
      * Attempts to acquire a lock, returning an empty {@link Optional} instead of
      * throwing if the lock cannot be granted.
      */
-    public CompletableFuture<Optional<LockItem>> tryAcquireLockAsync(final AcquireLockOptions options) {
+    public CompletableFuture<Optional<LockItemAsync>> tryAcquireLockAsync(final AcquireLockOptions options) {
         return acquireLockAsync(options)
                 .thenApply(Optional::of)
                 .exceptionally(ex -> {
@@ -479,19 +471,12 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
      */
     public boolean hasLock(final String key, final Optional<String> sortKey) {
         Objects.requireNonNull(sortKey, "Sort Key must not be null (can be Optional.empty())");
-        final LockItem local = this.locks.get(key + sortKey.orElse(""));
+        final LockItemAsync local = this.locks.get(key + sortKey.orElse(""));
         return local != null && !local.isExpired();
     }
 
     /** Releases the lock, deleting or marking it as released per the lock's own setting. */
-    public CompletableFuture<Boolean> releaseLockAsync(final LockItem lockItem) {
-        return releaseLockAsync(ReleaseLockOptions.builder(lockItem)
-                .withDeleteLock(lockItem.getDeleteLockItemOnClose()).build());
-    }
-
-    public CompletableFuture<Boolean> releaseLockAsync(final ReleaseLockOptions options) {
-        Objects.requireNonNull(options, "ReleaseLockOptions cannot be null");
-        final LockItem lockItem = options.getLockItem();
+    public CompletableFuture<Boolean> releaseLockAsync(final LockItemAsync lockItem) {
         Objects.requireNonNull(lockItem, "Cannot release null lockItem");
 
         if (!lockItem.getOwnerName().equals(this.ownerName)) {
@@ -501,9 +486,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
         // Remove from heartbeat map immediately — mirrors sync client behaviour.
         this.locks.remove(lockItem.getUniqueIdentifier());
 
-        final boolean deleteLock = options.isDeleteLock();
-        final boolean bestEffort = options.isBestEffort();
-        final Optional<ByteBuffer> data = options.getData();
+        final boolean deleteLock = lockItem.getDeleteLockItemOnClose();
 
         final Map<String, AttributeValue> expressionAttributeValues = new HashMap<>();
         final Map<String, String> expressionAttributeNames = new HashMap<>();
@@ -538,18 +521,9 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
         } else {
             expressionAttributeNames.put(IS_RELEASED_PATH_EXPRESSION_VARIABLE, IS_RELEASED);
             expressionAttributeValues.put(IS_RELEASED_VALUE_EXPRESSION_VARIABLE, IS_RELEASED_ATTRIBUTE_VALUE);
-            final String updateExpression;
-            if (data.isPresent()) {
-                updateExpression = UPDATE_IS_RELEASED_AND_DATA;
-                expressionAttributeNames.put(DATA_PATH_EXPRESSION_VARIABLE, DATA);
-                expressionAttributeValues.put(DATA_VALUE_EXPRESSION_VARIABLE,
-                        AttributeValue.builder().b(SdkBytes.fromByteBuffer(data.get())).build());
-            } else {
-                updateExpression = UPDATE_IS_RELEASED;
-            }
             ddbCall = this.dynamoDB.updateItem(UpdateItemRequest.builder()
                     .tableName(tableName).key(itemKey)
-                    .updateExpression(updateExpression)
+                    .updateExpression(UPDATE_IS_RELEASED)
                     .conditionExpression(conditionalExpression)
                     .expressionAttributeNames(expressionAttributeNames)
                     .expressionAttributeValues(expressionAttributeValues).build())
@@ -567,38 +541,16 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
                         logger.debug("Someone else acquired the lock before you asked to release it", cause);
                         return false;
                     }
-                    if (cause instanceof SdkClientException && bestEffort) {
-                        logger.warn("Ignoring SdkClientException on best-effort release", cause);
-                        removeKillSessionMonitor(lockItem.getUniqueIdentifier());
-                        return true;
-                    }
                     if (ex instanceof RuntimeException) throw (RuntimeException) ex;
                     throw new RuntimeException(ex);
                 });
     }
 
-    /** Sends a heartbeat for the given lock using default options. */
-    public CompletableFuture<Void> sendHeartbeatAsync(final LockItem lockItem) {
-        return sendHeartbeatAsync(SendHeartbeatOptions.builder(lockItem).build());
-    }
+    /** Sends a heartbeat for the given lock, refreshing its lease duration. */
+    public CompletableFuture<Void> sendHeartbeatAsync(final LockItemAsync lockItem) {
+        Objects.requireNonNull(lockItem, "Cannot send heartbeat for null lock");
+        final long finalLeaseDurationMs = this.leaseDurationInMilliseconds;
 
-    public CompletableFuture<Void> sendHeartbeatAsync(final SendHeartbeatOptions options) {
-        Objects.requireNonNull(options, "options is required");
-        Objects.requireNonNull(options.getLockItem(), "Cannot send heartbeat for null lock");
-
-        final boolean deleteData = options.getDeleteData() != null && options.getDeleteData();
-        if (deleteData && options.getData().isPresent()) {
-            throw new IllegalArgumentException("data must not be present if deleteData is true");
-        }
-
-        long leaseDurationMs = this.leaseDurationInMilliseconds;
-        if (options.getLeaseDurationToEnsure() != null) {
-            Objects.requireNonNull(options.getTimeUnit(), "TimeUnit must not be null if leaseDurationToEnsure is not null");
-            leaseDurationMs = options.getTimeUnit().toMillis(options.getLeaseDurationToEnsure());
-        }
-        final long finalLeaseDurationMs = leaseDurationMs;
-
-        final LockItem lockItem = options.getLockItem();
         if (lockItem.isExpired() || !lockItem.getOwnerName().equals(this.ownerName) || lockItem.isReleased()) {
             this.locks.remove(lockItem.getUniqueIdentifier());
             return failedFuture(new LockNotGrantedException("Cannot send heartbeat because lock is not granted"));
@@ -627,18 +579,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
             exprValues.put(NEW_RVN_VALUE_EXPRESSION_VARIABLE, AttributeValue.builder().s(newRvn).build());
             exprValues.put(LEASE_DURATION_VALUE_EXPRESSION_VARIABLE,
                     AttributeValue.builder().s(String.valueOf(finalLeaseDurationMs)).build());
-            final String updateExpr;
-            if (deleteData) {
-                exprNames.put(DATA_PATH_EXPRESSION_VARIABLE, DATA);
-                updateExpr = UPDATE_LEASE_DURATION_AND_RVN_AND_REMOVE_DATA;
-            } else if (options.getData().isPresent()) {
-                exprNames.put(DATA_PATH_EXPRESSION_VARIABLE, DATA);
-                exprValues.put(DATA_VALUE_EXPRESSION_VARIABLE,
-                        AttributeValue.builder().b(SdkBytes.fromByteBuffer(options.getData().get())).build());
-                updateExpr = UPDATE_LEASE_DURATION_AND_RVN_AND_DATA;
-            } else {
-                updateExpr = UPDATE_LEASE_DURATION_AND_RVN;
-            }
+            final String updateExpr = UPDATE_LEASE_DURATION_AND_RVN;
             updateItemRequest = UpdateItemRequest.builder()
                     .tableName(tableName).key(getItemKeys(lockItem))
                     .conditionExpression(condExpr).updateExpression(updateExpr)
@@ -647,17 +588,11 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
 
         final long lastUpdate = LockClientUtils.INSTANCE.millisecondTime();
         final String capturedRvn = newRvn;
-        final boolean capturedDeleteData = deleteData;
 
         return this.dynamoDB.updateItem(updateItemRequest)
                 .thenAccept(resp -> {
                     synchronized (lockItem) {
                         lockItem.updateRecordVersionNumber(capturedRvn, lastUpdate, finalLeaseDurationMs);
-                        if (capturedDeleteData) {
-                            lockItem.updateData(null);
-                        } else if (options.getData().isPresent()) {
-                            lockItem.updateData(options.getData().get());
-                        }
                     }
                 })
                 .exceptionally(ex -> {
@@ -686,9 +621,9 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
      * Returns the lock if currently held locally or retrieves it from DynamoDB.
      * Clears the RVN so callers cannot accidentally heartbeat a lock they don't own.
      */
-    public CompletableFuture<Optional<LockItem>> getLockAsync(final String key, final Optional<String> sortKey) {
+    public CompletableFuture<Optional<LockItemAsync>> getLockAsync(final String key, final Optional<String> sortKey) {
         Objects.requireNonNull(sortKey, "Sort Key must not be null (can be Optional.empty())");
-        final LockItem local = this.locks.get(key + sortKey.orElse(""));
+        final LockItemAsync local = this.locks.get(key + sortKey.orElse(""));
         if (local != null) {
             return CompletableFuture.completedFuture(Optional.of(local));
         }
@@ -696,10 +631,10 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
                 .withSortKey(sortKey.orElse(null)).withDeleteLockOnRelease(false).build())
                 .thenApply(lockItem -> {
                     if (!lockItem.isPresent()) {
-                        return Optional.<LockItem>empty();
+                        return Optional.<LockItemAsync>empty();
                     }
                     if (lockItem.get().isReleased()) {
-                        return Optional.<LockItem>empty();
+                        return Optional.<LockItemAsync>empty();
                     }
                     lockItem.get().updateRecordVersionNumber("", 0, lockItem.get().getLeaseDuration());
                     return lockItem;
@@ -707,7 +642,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
     }
 
     /** Reads a lock item directly from DynamoDB without acquiring it. */
-    public CompletableFuture<Optional<LockItem>> getLockFromDynamoDBAsync(final GetLockOptions options) {
+    public CompletableFuture<Optional<LockItemAsync>> getLockFromDynamoDBAsync(final GetLockOptions options) {
         Objects.requireNonNull(options, "GetLockOptions cannot be null");
         Objects.requireNonNull(options.getPartitionKey(), "Cannot lookup null key");
 
@@ -723,20 +658,20 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
         return this.dynamoDB.getItem(request).thenApply(response -> {
             final Map<String, AttributeValue> item = response.item();
             if (item == null || item.isEmpty()) {
-                return Optional.<LockItem>empty();
+                return Optional.<LockItemAsync>empty();
             }
             return Optional.of(createLockItem(options, item));
         });
     }
 
     /** Returns all locks in the table as a list (fetches all pages). */
-    public CompletableFuture<List<LockItem>> getAllLocksFromDynamoDBAsync(final boolean deleteOnRelease) {
+    public CompletableFuture<List<LockItemAsync>> getAllLocksFromDynamoDBAsync(final boolean deleteOnRelease) {
         final ScanRequest request = ScanRequest.builder().tableName(this.tableName).build();
         return scanAllPagesAsync(request, new ArrayList<>(), deleteOnRelease);
     }
 
-    private CompletableFuture<List<LockItem>> scanAllPagesAsync(
-            final ScanRequest request, final List<LockItem> accumulated, final boolean deleteOnRelease) {
+    private CompletableFuture<List<LockItemAsync>> scanAllPagesAsync(
+            final ScanRequest request, final List<LockItemAsync> accumulated, final boolean deleteOnRelease) {
         return this.dynamoDB.scan(request).thenCompose(response -> {
             response.items().forEach(item -> {
                 final String key = item.get(this.partitionKeyName).s();
@@ -751,7 +686,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
     }
 
     /** Returns all locks for a given partition key as a list (fetches all pages). */
-    public CompletableFuture<List<LockItem>> getLocksByPartitionKeyAsync(
+    public CompletableFuture<List<LockItemAsync>> getLocksByPartitionKeyAsync(
             final String key, final boolean deleteOnRelease) {
         final Map<String, String> exprNames = new HashMap<>();
         exprNames.put(PK_PATH_EXPRESSION_VARIABLE, this.partitionKeyName);
@@ -765,8 +700,8 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
         return queryAllPagesAsync(request, new ArrayList<>(), key, deleteOnRelease);
     }
 
-    private CompletableFuture<List<LockItem>> queryAllPagesAsync(
-            final QueryRequest request, final List<LockItem> accumulated,
+    private CompletableFuture<List<LockItemAsync>> queryAllPagesAsync(
+            final QueryRequest request, final List<LockItemAsync> accumulated,
             final String partitionKey, final boolean deleteOnRelease) {
         return this.dynamoDB.query(request).thenCompose(response -> {
             response.items().forEach(item ->
@@ -885,7 +820,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
      */
     public <T> CompletableFuture<T> withLockAsync(
             final AcquireLockOptions options,
-            final java.util.function.Function<LockItem, CompletableFuture<T>> work) {
+            final java.util.function.Function<LockItemAsync, CompletableFuture<T>> work) {
         return acquireLockAsync(options)
                 .thenCompose(lock ->
                         work.apply(lock)
@@ -934,13 +869,13 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
     // Private — session monitor management
     // -------------------------------------------------------------------------
 
-    private void tryAddSessionMonitor(final String lockName, final LockItem lock) {
+    private void tryAddSessionMonitor(final String lockName, final LockItemAsync lock) {
         if (lock.hasSessionMonitor() && lock.hasCallback()) {
             scheduleSessionMonitor(lockName, lock);
         }
     }
 
-    private void scheduleSessionMonitor(final String lockName, final LockItem lock) {
+    private void scheduleSessionMonitor(final String lockName, final LockItemAsync lock) {
         final long delayMs = Math.max(lock.millisecondsUntilDangerZoneEntered(), 0L);
         final ScheduledFuture<?> future = scheduler.schedule(() -> {
             if (lock.millisecondsUntilDangerZoneEntered() <= 0) {
@@ -965,7 +900,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
     // Private — acquire-lock upsert helpers
     // -------------------------------------------------------------------------
 
-    private CompletableFuture<LockItem> upsertAndMonitorNewLockAsync(
+    private CompletableFuture<LockItemAsync> upsertAndMonitorNewLockAsync(
             AcquireLockOptions options, String key, Optional<String> sortKey,
             boolean deleteLockOnRelease, Optional<SessionMonitor> sessionMonitor,
             Optional<ByteBuffer> newLockData, Map<String, AttributeValue> item,
@@ -999,10 +934,10 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
         }
     }
 
-    private CompletableFuture<LockItem> upsertAndMonitorReleasedLockAsync(
+    private CompletableFuture<LockItemAsync> upsertAndMonitorReleasedLockAsync(
             AcquireLockOptions options, String key, Optional<String> sortKey,
             boolean deleteLockOnRelease, Optional<SessionMonitor> sessionMonitor,
-            Optional<LockItem> existingLock, Optional<ByteBuffer> newLockData,
+            Optional<LockItemAsync> existingLock, Optional<ByteBuffer> newLockData,
             Map<String, AttributeValue> item, String recordVersionNumber) {
 
         final boolean consistentLockData = options.getAcquireReleasedLocksConsistently();
@@ -1034,10 +969,10 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
                 REMOVE_IS_RELEASED_UPDATE_EXPRESSION, exprNames, exprValues, condExpr);
     }
 
-    private CompletableFuture<LockItem> upsertAndMonitorExpiredLockAsync(
+    private CompletableFuture<LockItemAsync> upsertAndMonitorExpiredLockAsync(
             AcquireLockOptions options, String key, Optional<String> sortKey,
             boolean deleteLockOnRelease, Optional<SessionMonitor> sessionMonitor,
-            Optional<LockItem> existingLock, Optional<ByteBuffer> newLockData,
+            Optional<LockItemAsync> existingLock, Optional<ByteBuffer> newLockData,
             Map<String, AttributeValue> item, String recordVersionNumber) {
 
         final Map<String, AttributeValue> exprValues = new HashMap<>();
@@ -1064,10 +999,10 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
      * When {@code updateExistingLockRecord} is true, issues an UpdateItem with
      * {@code baseUpdateExpr + extraUpdateExpr}; otherwise issues a PutItem.
      */
-    private CompletableFuture<LockItem> upsertOrPutExistingLockAsync(
+    private CompletableFuture<LockItemAsync> upsertOrPutExistingLockAsync(
             AcquireLockOptions options, String key, Optional<String> sortKey,
             boolean deleteLockOnRelease, Optional<SessionMonitor> sessionMonitor,
-            Optional<LockItem> existingLock, Optional<ByteBuffer> newLockData,
+            Optional<LockItemAsync> existingLock, Optional<ByteBuffer> newLockData,
             Map<String, AttributeValue> item, String recordVersionNumber,
             String extraUpdateExpr,
             Map<String, String> exprNames, Map<String, AttributeValue> exprValues,
@@ -1089,7 +1024,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
                         .expressionAttributeValues(exprValues).build());
     }
 
-    private CompletableFuture<LockItem> putLockItemAndStartSessionMonitorAsync(
+    private CompletableFuture<LockItemAsync> putLockItemAndStartSessionMonitorAsync(
             AcquireLockOptions options, String key, Optional<String> sortKey,
             boolean deleteLockOnRelease, Optional<SessionMonitor> sessionMonitor,
             Optional<ByteBuffer> newLockData, String recordVersionNumber,
@@ -1097,7 +1032,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
         // Capture time BEFORE the DDB call — errs on the side of expiring sooner.
         final long lastUpdated = LockClientUtils.INSTANCE.millisecondTime();
         return this.dynamoDB.putItem(request).thenApply(resp -> {
-            final LockItem lockItem = new LockItem(null, key, sortKey, newLockData,
+            final LockItemAsync lockItem = new LockItemAsync(key, sortKey, newLockData,
                     deleteLockOnRelease, this.ownerName, this.leaseDurationInMilliseconds,
                     lastUpdated, recordVersionNumber, false, sessionMonitor,
                     options.getAdditionalAttributes());
@@ -1107,14 +1042,14 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
         });
     }
 
-    private CompletableFuture<LockItem> updateItemAndStartSessionMonitorAsync(
+    private CompletableFuture<LockItemAsync> updateItemAndStartSessionMonitorAsync(
             AcquireLockOptions options, String key, Optional<String> sortKey,
             boolean deleteLockOnRelease, Optional<SessionMonitor> sessionMonitor,
             Optional<ByteBuffer> newLockData, String recordVersionNumber,
             UpdateItemRequest request) {
         final long lastUpdated = LockClientUtils.INSTANCE.millisecondTime();
         return this.dynamoDB.updateItem(request).thenApply(resp -> {
-            final LockItem lockItem = new LockItem(null, key, sortKey, newLockData,
+            final LockItemAsync lockItem = new LockItemAsync(key, sortKey, newLockData,
                     deleteLockOnRelease, this.ownerName, this.leaseDurationInMilliseconds,
                     lastUpdated, recordVersionNumber, false, sessionMonitor,
                     options.getAdditionalAttributes());
@@ -1128,7 +1063,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
     // Private — misc helpers
     // -------------------------------------------------------------------------
 
-    private LockItem createLockItem(final GetLockOptions options, final Map<String, AttributeValue> immutableItem) {
+    private LockItemAsync createLockItem(final GetLockOptions options, final Map<String, AttributeValue> immutableItem) {
         final Map<String, AttributeValue> item = new HashMap<>(immutableItem);
         final Optional<ByteBuffer> data = Optional.ofNullable(item.remove(DATA))
                 .map(av -> av.b().asByteBuffer());
@@ -1139,13 +1074,13 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
         item.remove(IS_RELEASED);
         item.remove(this.partitionKeyName);
         final long lookupTime = LockClientUtils.INSTANCE.millisecondTime();
-        return new LockItem(null, options.getPartitionKey(), options.getSortKey(), data,
+        return new LockItemAsync(options.getPartitionKey(), options.getSortKey(), data,
                 options.isDeleteLockOnRelease(), ownerNameAv.s(),
                 Long.parseLong(leaseDurationAv.s()), lookupTime, rvnAv.s(),
                 isReleased, Optional.empty(), item);
     }
 
-    private LockItem buildLockItemFromScanResult(
+    private LockItemAsync buildLockItemFromScanResult(
             final String key, final boolean deleteOnRelease, final Map<String, AttributeValue> item) {
         GetLockOptions.GetLockOptionsBuilder builder =
                 GetLockOptions.builder(key).withDeleteLockOnRelease(deleteOnRelease);
@@ -1154,7 +1089,7 @@ public class AmazonDynamoDBLockClientAsync implements Closeable {
         return createLockItem(builder.build(), item);
     }
 
-    private Map<String, AttributeValue> getItemKeys(final LockItem lockItem) {
+    private Map<String, AttributeValue> getItemKeys(final LockItemAsync lockItem) {
         return getKeys(lockItem.getPartitionKey(), lockItem.getSortKey());
     }
 

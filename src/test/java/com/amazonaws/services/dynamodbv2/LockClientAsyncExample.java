@@ -134,7 +134,7 @@ public class LockClientAsyncExample {
 
             // The session monitor fires when the lock has not been heartbeated for
             // (leaseDuration - safeTimeWithoutHeartbeat) = 10s - 4s = 6s.
-            final LockItem lock = client.acquireLockAsync(
+            final LockItemAsync lock = client.acquireLockAsync(
                     AcquireLockOptions.builder("Curly")
                             .withSessionMonitor(4L, Optional.of(() ->
                                     System.out.println("WARNING: lock for Curly is close to expiring!")))
