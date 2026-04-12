@@ -34,7 +34,7 @@ import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
  * @author <a href="mailto:slutsker@amazon.com">Sasha Slutsker</a>
  */
 public class LockItem implements Closeable {
-    private final LockItemOwner client;
+    private final AmazonDynamoDBLockClient client;
     private final String partitionKey;
     private final Optional<String> sortKey;
 
@@ -73,7 +73,7 @@ public class LockItem implements Closeable {
      * @param additionalAttributes          Additional attributes that can optionally be stored alongside
      *                                      the lock
      */
-    LockItem(final LockItemOwner client, final String partitionKey, final Optional<String> sortKey, final Optional<ByteBuffer> data, final boolean deleteLockItemOnClose,
+    LockItem(final AmazonDynamoDBLockClient client, final String partitionKey, final Optional<String> sortKey, final Optional<ByteBuffer> data, final boolean deleteLockItemOnClose,
         final String ownerName, final long leaseDuration, final long lastUpdatedTimeInMilliseconds, final String recordVersionNumber, final boolean isReleased,
         final Optional<SessionMonitor> sessionMonitor, final Map<String, AttributeValue> additionalAttributes) {
         Objects.requireNonNull(partitionKey, "Cannot create a lock with a null key");
@@ -184,6 +184,10 @@ public class LockItem implements Closeable {
      */
     @Override
     public void close() {
+        if (this.client == null) {
+            throw new UnsupportedOperationException(
+                    "close() is not supported for locks acquired via AmazonDynamoDBLockClientAsync. Use withLockAsync() instead.");
+        }
         this.client.releaseLock(this);
     }
 
@@ -255,6 +259,10 @@ public class LockItem implements Closeable {
      * This is equivalent to calling lockClient.sendHeartbeat(lockItem)
      */
     public void sendHeartBeat() {
+        if (this.client == null) {
+            throw new UnsupportedOperationException(
+                    "sendHeartBeat() is not supported for locks acquired via AmazonDynamoDBLockClientAsync. Use sendHeartbeatAsync() instead.");
+        }
         this.client.sendHeartbeat(this);
     }
 
@@ -284,6 +292,10 @@ public class LockItem implements Closeable {
         }
         final long leaseDurationToEnsureInMilliseconds = timeUnit.toMillis(leaseDurationToEnsure);
         if (this.leaseDuration.get() - (LockClientUtils.INSTANCE.millisecondTime() - this.lookupTime.get()) <= leaseDurationToEnsureInMilliseconds) {
+            if (this.client == null) {
+                throw new UnsupportedOperationException(
+                        "ensure() is not supported for locks acquired via AmazonDynamoDBLockClientAsync. Use sendHeartbeatAsync() instead.");
+            }
             this.client.sendHeartbeat(SendHeartbeatOptions.builder(this).withLeaseDurationToEnsure(leaseDurationToEnsure).withTimeUnit(timeUnit).build());
         }
     }
