@@ -164,6 +164,86 @@ You can read the data in the lock without acquiring it, and find out who owns th
 LockItem lock = lockClient.getLock("Moe");
 ```
 
+## Async Client
+
+`AmazonDynamoDBLockClientAsync` provides a non-blocking alternative built on `CompletableFuture`.
+It uses a `DynamoDbAsyncClient` under the hood and never blocks a calling thread.
+
+### Setup
+
+```java
+final DynamoDbAsyncClient dynamoDB = DynamoDbAsyncClient.builder()
+        .region(Region.US_WEST_2)
+        .build();
+
+final AmazonDynamoDBLockClientAsync client = new AmazonDynamoDBLockClientAsync(
+        AmazonDynamoDBLockClientAsyncOptions.builder(dynamoDB, "lockTable")
+                .withTimeUnit(TimeUnit.SECONDS)
+                .withLeaseDuration(10L)
+                .withHeartbeatPeriod(3L)
+                .build());
+```
+
+### Run work once under a lock
+
+`runWithLockAsync` acquires the lock, runs your async work, then releases the lock.
+The lock is never exposed to your code.
+
+```java
+CompletableFuture<String> result = client.runWithLockAsync("Moe", () ->
+        CompletableFuture.supplyAsync(() -> {
+            // work that must run exclusively
+            return "done";
+        })
+);
+```
+
+Pass an `AcquireLockOptions` when you need finer control (e.g. timeouts, session monitors, data):
+
+```java
+CompletableFuture<Void> result = client.runWithLockAsync(
+        AcquireLockOptions.builder("Moe")
+                .withSessionMonitor(5L, Optional.of(() -> System.out.println("danger zone!")))
+                .build(),
+        () -> doWorkAsync()
+);
+```
+
+### Loop work under a lock
+
+`loopWithLockAsync` acquires the lock once and then repeatedly calls your supplier until either
+the returned future is cancelled or the lock expires.
+
+```java
+CompletableFuture<Void> loop = client.loopWithLockAsync("leader", () ->
+        CompletableFuture.runAsync(() -> pollAndProcess())
+);
+
+// stop the loop from outside
+loop.cancel(false);
+```
+
+### Create the lock table
+
+```java
+AmazonDynamoDBLockClientAsync.createLockTableInDynamoDBAsync(
+        dynamoDB, "lockTable", "key",
+        Optional.empty(),                              // no sort key
+        ProvisionedThroughput.builder()
+                .readCapacityUnits(5L)
+                .writeCapacityUnits(5L)
+                .build()
+).join();
+```
+
+### Shutdown
+
+```java
+client.closeAsync().join();   // non-blocking shutdown
+// or
+client.close();               // blocks until the heartbeat thread stops
+```
+
 ## How we handle clock skew
 The lock client never stores absolute times in DynamoDB -- only the relative "lease duration" time is stored
 in DynamoDB. The way locks are expired is that a call to acquireLock reads in the current lock, checks the

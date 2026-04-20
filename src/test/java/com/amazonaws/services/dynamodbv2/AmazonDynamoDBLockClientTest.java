@@ -49,9 +49,8 @@ import org.powermock.modules.junit4.PowerMockRunner;
 
 import com.amazonaws.services.dynamodbv2.util.LockClientUtils;
 
-import static com.amazonaws.services.dynamodbv2.AmazonDynamoDBLockClient
-        .PK_EXISTS_AND_RVN_IS_THE_SAME_AND_IS_RELEASED_CONDITION;
-import static com.amazonaws.services.dynamodbv2.AmazonDynamoDBLockClient.RVN_VALUE_EXPRESSION_VARIABLE;
+import static com.amazonaws.services.dynamodbv2.LockDaoConstants.PK_EXISTS_AND_RVN_IS_THE_SAME_AND_IS_RELEASED_CONDITION;
+import static com.amazonaws.services.dynamodbv2.LockDaoConstants.RVN_VALUE_EXPRESSION_VARIABLE;
 import static org.junit.Assert.assertEquals;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
